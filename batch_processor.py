@@ -255,17 +255,49 @@ def _build_psd_via_photoshop(order_id, row, out_path, force_bg_remove=False, qua
         quantity = quantity * 2
         log(f"  Socks pair: printing {quantity} copies (2 per ordered pair)", "INFO")
 
-    _ps_submit(order_id, template_path, zones, out_path,
-               canvas_w_px=canvas_w, canvas_h_px=canvas_h, combined=True,
-               quantity=quantity)
-    # Increase timeout for multi-copy orders (each copy takes ~same time)
-    timeout = 600 * max(1, quantity // 2) if quantity > 2 else 600
-    success = _ps_wait(order_id, timeout_sec=timeout, use_uxp=True)
-    if success:
-        if not os.path.isfile(out_path):
-            return False, f"UXP reported done but output file missing: {out_path}"
-        return True, out_path
-    return False, "Photoshop UXP timed out or errored"
+    # ── Split into multiple PSDs if the stacked canvas would exceed the ~30,000px
+    # PSD format height ceiling — same fix and reasoning as _build_psd_multi_via_photoshop
+    # (regular .psd files cannot exceed 30000px per side; UXP's save can silently fail
+    # past that while still reporting "done"). Every copy here is identical, so the
+    # per-copy height is one fixed value rather than something computed per item.
+    _LABEL_PX, _GAP_PX, _QTY_GAP_PX = 126, 126, 126
+    _SAFE_MAX_H = 28000  # margin below the hard 30000px ceiling
+
+    per_copy_h    = sum(_LABEL_PX + z["zone_h_px"] + _GAP_PX for z in zones.values())
+    max_per_chunk = max(1, int((_SAFE_MAX_H + _QTY_GAP_PX) // (per_copy_h + _QTY_GAP_PX)))
+
+    remaining, chunk_sizes = quantity, []
+    while remaining > 0:
+        k = min(max_per_chunk, remaining)
+        chunk_sizes.append(k)
+        remaining -= k
+
+    if len(chunk_sizes) > 1:
+        log(f"  Quantity={quantity} needs {len(chunk_sizes)} PSDs — combined stack would exceed the 30,000px PSD height limit", "INFO")
+
+    output_paths = []
+    for idx, k in enumerate(chunk_sizes):
+        if idx == 0:
+            chunk_out_path = out_path
+        else:
+            _root = out_path[:-4] if out_path.lower().endswith(".psd") else out_path
+            chunk_out_path = f"{_root}-{idx}.psd"
+
+        _ps_submit(order_id, template_path, zones, chunk_out_path,
+                   canvas_w_px=canvas_w, canvas_h_px=canvas_h, combined=True,
+                   quantity=k)
+        # Increase timeout for multi-copy chunks (each copy takes ~same time)
+        timeout = 600 * max(1, k // 2) if k > 2 else 600
+        success = _ps_wait(order_id, timeout_sec=timeout, use_uxp=True)
+        if not success:
+            return False, f"Photoshop UXP timed out or errored (batch {idx + 1}/{len(chunk_sizes)})"
+        if not os.path.isfile(chunk_out_path):
+            return False, f"UXP reported done but output file missing: {chunk_out_path} (batch {idx + 1}/{len(chunk_sizes)})"
+        output_paths.append(chunk_out_path)
+
+    if len(output_paths) == 1:
+        return True, output_paths[0]
+    return True, f"{len(output_paths)} PSD(s): " + ", ".join(os.path.basename(p) for p in output_paths)
 
 
 def _build_psd_multi_via_photoshop(order_id, group_rows, out_path, force_bg_remove=False):
@@ -378,22 +410,68 @@ def _build_psd_multi_via_photoshop(order_id, group_rows, out_path, force_bg_remo
     if not multi_items:
         return False, "No zones found across all items"
 
-    _ps_submit(order_id, template_path,
-               multi_items[0]["zones"],   # primary zones (first item) for template compat
-               out_path,
-               canvas_w_px=canvas_w or 9600,
-               canvas_h_px=canvas_h or 9600,
-               combined=True,
-               quantity=1,
-               multi_items=multi_items)
+    # ── Split into multiple PSDs if the stacked canvas would exceed the ~30,000px
+    # PSD format height ceiling — regular .psd files cannot exceed 30000px per side
+    # (a hard format limit, not a performance issue; index.js's resizeAllTemplates
+    # already treats TARGET_H=30000 as "Max PSD height" for the same reason). Past
+    # that size, UXP's save can silently fail while still reporting "done", which is
+    # exactly the "reported done but file missing" failure this fixes.
+    #
+    # Chunk boundaries mirror the exact per-item height formula the UXP plugin uses
+    # for job.multi_items (LABEL_PX + zone_h_px + GAP_PX per zone, plus QTY_GAP_PX
+    # between items — see index.js's multi-item totalH calculation), so this lands
+    # chunks correctly regardless of how many zones an item has or how tall the
+    # product is, instead of assuming a fixed item count per file.
+    _LABEL_PX, _GAP_PX, _QTY_GAP_PX = 126, 126, 126
+    _SAFE_MAX_H = 28000  # margin below the hard 30000px ceiling
 
-    timeout = 600 * len(multi_items)
-    success = _ps_wait(order_id, timeout_sec=timeout, use_uxp=True)
-    if success:
-        if not os.path.isfile(out_path):
-            return False, f"UXP reported done but output file missing: {out_path}"
-        return True, out_path
-    return False, "Photoshop UXP timed out or errored"
+    def _item_height(item):
+        return sum(_LABEL_PX + (z.get("zone_h_px") or 9600) + _GAP_PX for z in item["zones"].values())
+
+    chunks, _cur, _cur_h = [], [], 0
+    for item in multi_items:
+        ih = _item_height(item)
+        added = ih + (_QTY_GAP_PX if _cur else 0)
+        if _cur and _cur_h + added > _SAFE_MAX_H:
+            chunks.append(_cur)
+            _cur, _cur_h = [item], ih
+        else:
+            _cur_h += added
+            _cur.append(item)
+    if _cur:
+        chunks.append(_cur)
+
+    if len(chunks) > 1:
+        log(f"  Multi-item order needs {len(chunks)} PSDs — combined stack would exceed the 30,000px PSD height limit", "INFO")
+
+    output_paths = []
+    for idx, chunk in enumerate(chunks):
+        if idx == 0:
+            chunk_out_path = out_path
+        else:
+            _root = out_path[:-4] if out_path.lower().endswith(".psd") else out_path
+            chunk_out_path = f"{_root}-{idx}.psd"
+
+        _ps_submit(order_id, template_path,
+                   chunk[0]["zones"],   # primary zones (first item) for template compat
+                   chunk_out_path,
+                   canvas_w_px=canvas_w or 9600,
+                   canvas_h_px=canvas_h or 9600,
+                   combined=True,
+                   quantity=1,
+                   multi_items=chunk)
+
+        timeout = 600 * len(chunk)
+        success = _ps_wait(order_id, timeout_sec=timeout, use_uxp=True)
+        if not success:
+            return False, f"Photoshop UXP timed out or errored (batch {idx + 1}/{len(chunks)})"
+        if not os.path.isfile(chunk_out_path):
+            return False, f"UXP reported done but output file missing: {chunk_out_path} (batch {idx + 1}/{len(chunks)})"
+        output_paths.append(chunk_out_path)
+
+    if len(output_paths) == 1:
+        return True, output_paths[0]
+    return True, f"{len(output_paths)} PSD(s): " + ", ".join(os.path.basename(p) for p in output_paths)
 
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
@@ -3949,7 +4027,19 @@ def run_batch(limit=None, order_id_filter=None, dry_run=False, sku_filter=None, 
             continue
 
         # ── Topaz / image-readiness check ────────────────────────────────────
-        # Determine whether this order has any image zones at all
+        # Each row/item can have its own Topaz state, so check per-row rather than
+        # assuming first_row speaks for the whole group — a multi-item order can have
+        # one item ready and another still pending. A row is "pending" when Topaz
+        # hasn't confirmed done (flag isn't 1/True) AND a Topaz filename is already
+        # on record for it — that's what tells us Topaz was actually asked to produce
+        # one. A flag of 0 with no Topaz filename at all means Topaz was never
+        # invoked for that image, so there's nothing to wait for.
+        def _topaz_pending(r):
+            if r.get("IsTopazImageProcess") in (1, True):
+                return False
+            return any((r.get(c) or "").strip() for c in
+                       ("FrontTopazImage", "BackTopazImage", "PocketTopazImage", "SleeveTopazImage"))
+
         _has_image = any(
             (r.get("FrontImage") or "").strip() or
             (r.get("BackImage")  or "").strip() or
@@ -3957,18 +4047,23 @@ def run_batch(limit=None, order_id_filter=None, dry_run=False, sku_filter=None, 
             (r.get("SleeveImage") or "").strip()
             for r in group_rows
         )
-        _topaz_flag = first_row.get("IsTopazImageProcess")
+        _pending_rows = [r for r in group_rows if _topaz_pending(r)]
 
-        if _has_image and _topaz_flag is None:
-            # Image order but Topaz has not yet processed it (IsTopazImageProcess=NULL).
+        if _has_image and _pending_rows:
+            # Image order but Topaz hasn't confirmed done for at least one item.
             # Option C: wait 30 mins, then re-check DB.
             #   → If Topaz flipped to 1  → use FrontTopazImage (best quality)
-            #   → If still NULL after 30m → fall back to original FrontImage
+            #   → If still not ready after 30m → fall back to original FrontImage
             date_add = first_row.get("DateAdd")
             age_mins = None
             if date_add:
                 try:
-                    age_mins = (datetime.utcnow() - date_add).total_seconds() / 60
+                    # DateAdd is written in the DB server's local time (UK), not UTC —
+                    # confirmed by comparing GETDATE()/GETUTCDATE() against this machine's
+                    # own clock, which runs the same local timezone. datetime.utcnow() here
+                    # was comparing a local timestamp against true UTC, silently shifting
+                    # every age by the local UTC offset (+1h during BST).
+                    age_mins = (datetime.now() - date_add).total_seconds() / 60
                 except Exception:
                     age_mins = None
 
@@ -3978,37 +4073,34 @@ def run_batch(limit=None, order_id_filter=None, dry_run=False, sku_filter=None, 
                 skip_count += 1
                 continue
 
-            # Order is ≥ 30 mins old — re-query DB to get the latest IsTopazImageProcess
-            try:
-                _recheck_conn = get_db()
-                _rc = _recheck_conn.cursor()
-                _rc.execute(
-                    "SELECT IsTopazImageProcess, FrontTopazImage, BackTopazImage, "
-                    "PocketTopazImage, SleeveTopazImage "
-                    "FROM tblCustomOrderDetails "
-                    "WHERE idCustomOrderDetails = ?",
-                    first_row.get("idCustomOrderDetails")
-                )
-                _fresh = _rc.fetchone()
-                _recheck_conn.close()
-                if _fresh:
-                    _fresh_topaz_flag = _fresh[0]
-                    if _fresh_topaz_flag == 1 or _fresh_topaz_flag is True:
-                        # Topaz is now done — update all rows in this group with fresh Topaz data
-                        log(f"  Topaz now ready for {order_id} — using Topaz images", "INFO")
-                        for r in group_rows:
+            # Order is ≥ 30 mins old — re-query DB for each pending row's latest IsTopazImageProcess
+            for r in _pending_rows:
+                try:
+                    _recheck_conn = get_db()
+                    _rc = _recheck_conn.cursor()
+                    _rc.execute(
+                        "SELECT IsTopazImageProcess, FrontTopazImage, BackTopazImage, "
+                        "PocketTopazImage, SleeveTopazImage "
+                        "FROM tblCustomOrderDetails "
+                        "WHERE idCustomOrderDetails = ?",
+                        r.get("idCustomOrderDetails")
+                    )
+                    _fresh = _rc.fetchone()
+                    _recheck_conn.close()
+                    if _fresh:
+                        _fresh_topaz_flag = _fresh[0]
+                        if _fresh_topaz_flag == 1 or _fresh_topaz_flag is True:
+                            # Topaz is now done for this item — update just this row's Topaz data
+                            log(f"  Topaz now ready for {order_id} [{r.get('idCustomOrderDetails')}] — using Topaz images", "INFO")
                             r["IsTopazImageProcess"] = 1
                             r["FrontTopazImage"]  = _fresh[1] or r.get("FrontTopazImage")
                             r["BackTopazImage"]   = _fresh[2] or r.get("BackTopazImage")
                             r["PocketTopazImage"] = _fresh[3] or r.get("PocketTopazImage")
                             r["SleeveTopazImage"] = _fresh[4] or r.get("SleeveTopazImage")
-                    else:
-                        # Still NULL after 30 mins — Topaz failed/slow.
-                        # Process silently with original FrontImage (use_topaz stays False in build_zones)
-                        pass
-            except Exception:
-                pass  # DB re-check failed — process with original FrontImage silently
-        # Text-only orders (NULL + no image) and Topaz=1 orders fall through to normal processing
+                        # else: still not ready after 30 mins — process with original image (use_topaz stays False)
+                except Exception:
+                    pass  # DB re-check failed — process with original image silently
+        # Text-only orders (no image) and rows with Topaz already ready/not-expected fall through to normal processing
 
         if is_multi:
             folder_type = "Automated"

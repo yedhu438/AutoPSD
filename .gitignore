@@ -52,3 +52,8 @@ trigger_ps.vbs
 *.psd
 *.psb
 *.bak
+
+# Migration bundle (holds .env + rclone.conf secrets and ~1 GB of assets) and the
+# in-flight job queue (job JSONs contain customer personalisation data)
+migration/bundle/
+jobs/

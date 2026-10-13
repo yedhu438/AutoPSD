@@ -1,5 +1,5 @@
 {
-  "manifestVersion": 4,
+  "manifestVersion": 5,
   "id": "com.varsany.automation.worker",
   "name": "Varsany Order Processor",
   "version": "1.0.0",
@@ -15,13 +15,11 @@
       "label": { "default": "Varsany Orders" },
       "minimumSize": { "width": 220, "height": 140 },
       "maximumSize": { "width": 800, "height": 600 },
-      "preferredDockedSize": { "width": 240, "height": 160 },
-      "show": true
+      "preferredDockedSize": { "width": 240, "height": 160 }
     }
   ],
   "requiredPermissions": {
     "localFileSystem": "fullAccess",
-    "allowCodeGenerationFromStrings": true,
     "network": {
       "domains": "all"
     }

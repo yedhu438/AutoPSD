@@ -22,6 +22,22 @@ async function getOrCreate(parent,name){try{return await parent.getEntry(name);}
 async function readJSON(e){return JSON.parse(await e.read({format:uxp.storage.formats.utf8}));}
 async function writeJSON(folder,filename,data){const f=await folder.createFile(filename,{overwrite:true});await f.write(JSON.stringify(data,null,2),{format:uxp.storage.formats.utf8});}
 
+// ── Memory hygiene ────────────────────────────────────────────────────────────
+// No purge/history-state calls existed anywhere in this file before — every
+// batchPlay op (placement, transform, text, rasterize) leaves an undo history
+// state that accumulates for the life of the Photoshop session. Call this
+// right after each doc.close() (must run while still inside executeAsModal).
+async function purgeCaches(){
+  try{ await app.purge(constants.PurgeTarget.ALL_CACHES); }
+  catch(e){ /* non-fatal — older PS builds / API shape may differ */ }
+}
+// Cap undo history so old states get evicted instead of piling up all session.
+// Safe to call once at startup; doesn't need executeAsModal.
+async function configurePerformance(){
+  try{ app.preferences.numberOfHistoryStates = 5; log("History states capped at 5"); }
+  catch(e){ log("Could not set history state limit: "+e.message, true); }
+}
+
 // ── Token / folder init ───────────────────────────────────────────────────────
 async function loadRootToken(){
   // Try gimpTest first, then legacy Varsany
@@ -481,6 +497,7 @@ async function processJob(jobEntry){
           log("Saved: "+outEntry.name);
           await doc.close(constants.SaveOptions.DONOTSAVECHANGES);
           doc=null; success=true;
+          await purgeCaches();
 
         } else {
           // ── Multi-item v3.7: expand template in-place, stack items ───────────────
@@ -527,6 +544,7 @@ async function processJob(jobEntry){
 
             // Close the fresh copy — now ONLY the expanded template doc is open
             await app.activeDocument.close(constants.SaveOptions.DONOTSAVECHANGES);
+            await purgeCaches();  // this loop can open/close a full-size CMYK doc per item — purge each time
 
             // Paste into expanded template (only 1 doc open — unambiguous target)
             await bp([{_obj:"paste"}]);
@@ -557,6 +575,7 @@ async function processJob(jobEntry){
           success=true;  // mark success before close — file is on disk regardless
           try{ await doc.close(constants.SaveOptions.DONOTSAVECHANGES); }catch(ce){ log("Close warning (non-fatal): "+ce.message, true); }
           doc=null;
+          await purgeCaches();
         }
 
       } else {
@@ -786,9 +805,10 @@ async function processJob(jobEntry){
       log("Saved: "+outEntry.name);
       await doc.close(constants.SaveOptions.DONOTSAVECHANGES);
       doc=null; success=true;
+      await purgeCaches();
 
       } // end else (standard zone processing)
-    }catch(e){errorMsg=e.message||String(e);if(doc)try{await doc.close(constants.SaveOptions.DONOTSAVECHANGES);}catch(x){}}
+    }catch(e){errorMsg=e.message||String(e);if(doc)try{await doc.close(constants.SaveOptions.DONOTSAVECHANGES);}catch(x){}await purgeCaches();}
   },{commandName:"Process "+orderId});
 
   if(success){
@@ -836,6 +856,8 @@ async function buildAllTemplates(jobEntry){
         failed++;
         log("FAILED: "+fname+" — "+e.message, true);
         if(newDoc) try{ await newDoc.close(constants.SaveOptions.DONOTSAVECHANGES); }catch(x){}
+      }finally{
+        await purgeCaches();
       }
     }
   },{commandName:"Build all templates"});
@@ -922,8 +944,14 @@ async function createAllTemplates(){
     const tplFolder = await getOrCreate(VARSANY_ROOT,"template");
     log("Creating "+PRODUCTS.length+" templates...");
     await core.executeAsModal(async()=>{
-      const openDocs = [];
+      let closed = 0;
       for(const [name,wcm] of PRODUCTS){
+        // FIX: previously docs were pushed to an openDocs[] list and all closed
+        // together at the very end — meaning up to 23 large (wpx x 15000px)
+        // CMYK docs could sit open simultaneously, and any doc from an
+        // iteration that threw before the push was never closed at all.
+        // Now every doc is closed (and purged) immediately, success or failure.
+        let newDoc = null;
         try{
           const wpx = PX(wcm);
           await bp([{_obj:"make",new:{_obj:"document",artboard:false,autoPromoteBackgroundLayer:false,
@@ -937,20 +965,21 @@ async function createAllTemplates(){
             depth:8,
             profile:"U.S. Web Coated (SWOP) v2"
           }}]);
+          newDoc = app.activeDocument;
           // Save via UXP entry (uses VARSANY_ROOT dynamically)
           const tplFileEntry = await tplFolder.createFile(name+"_combined.psd",{overwrite:true});
-          await app.activeDocument.saveAs.psd(tplFileEntry,{embedColorProfile:true},true);
-          openDocs.push(app.activeDocument);
+          await newDoc.saveAs.psd(tplFileEntry,{embedColorProfile:true},true);
           log("Saved: "+name+"_combined.psd ("+wpx+"x15000px)");
         }catch(e){
           log("Error: "+name+" — "+e.message,true);
+        }finally{
+          if(newDoc){
+            try{await newDoc.close(constants.SaveOptions.DONOTSAVECHANGES); closed++;}catch(x){}
+            await purgeCaches();
+          }
         }
       }
-      // Close all at end
-      for(const d of openDocs){
-        try{await d.close(constants.SaveOptions.DONOTSAVECHANGES);}catch(x){}
-      }
-      log("Closed "+openDocs.length+" documents.");
+      log("Closed "+closed+" documents.");
     },{commandName:"Create all product templates"});
     log("All templates created in template\\ folder");
   }catch(e){log("Error: "+e.message,true);}
@@ -978,6 +1007,7 @@ async function resizeAllTemplates(){
           const {w:curW, h:curH} = await getDocSize();
           if(curH >= TARGET_H){
             await doc.close(constants.SaveOptions.DONOTSAVECHANGES);
+            await purgeCaches();
             skipped++; log("Skip: "+entry.name+" (already "+curH+"px)"); continue;
           }
           // Resize canvas to TARGET_H
@@ -985,11 +1015,13 @@ async function resizeAllTemplates(){
           // Save using saveAs.psd DOM API
           await doc.saveAs.psd(entry, {embedColorProfile:true}, true);
           await doc.close(constants.SaveOptions.DONOTSAVECHANGES);
+          await purgeCaches();
           done++;
           log("Resized: "+entry.name+" ("+curW+"x"+TARGET_H+"px)");
         }catch(e){
           log("Error: "+entry.name+" — "+e.message, true);
           try{await app.activeDocument.close(constants.SaveOptions.DONOTSAVECHANGES);}catch(x){}
+          await purgeCaches();
         }
       }
     },{commandName:"Resize templates"});
@@ -1000,6 +1032,7 @@ async function resizeAllTemplates(){
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 initFolders().finally(()=>{
+  configurePerformance();
   document.getElementById("pickBtn").addEventListener("click", pickRoot);
   document.getElementById("mkCombinedBtn").addEventListener("click", createCombinedTemplate);
   document.getElementById("mkAllTplBtn").addEventListener("click", createAllTemplates);
