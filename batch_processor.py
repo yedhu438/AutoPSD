@@ -149,7 +149,7 @@ def _build_psd_via_photoshop(order_id, row, out_path, force_bg_remove=False, qua
         "pocket": ("PocketText", "PocketFonts", "PocketColours", "PocketImage", "PocketImageJSON", "PocketPreviewImage", "PocketTopazImage"),
         "sleeve": ("SleeveText", "SleeveFonts", "SleeveColours", "SleeveImage", "SleeveImageJSON", "SleevePreviewImage", "SleeveTopazImage"),
     }
-    product_canvas = PRODUCT_CANVAS.get(product, PRODUCT_CANVAS["default"])
+    product_canvas = get_product_canvas(sku, product)
     garment_rgb    = get_garment_rgb(sku)
     bg_flag_cols   = {
         "front":  "IsFrontBgRemove",
@@ -329,7 +329,7 @@ def _build_psd_multi_via_photoshop(order_id, group_rows, out_path, force_bg_remo
     for row in group_rows:
         row_sku      = row.get("SKU") or ""
         row_product  = detect_product(row_sku)
-        prod_canvas  = PRODUCT_CANVAS.get(row_product, PRODUCT_CANVAS["default"])
+        prod_canvas  = get_product_canvas(row_sku, row_product)
         garment_rgb  = get_garment_rgb(row_sku)
         use_topaz    = (row.get("IsTopazImageProcess") in (1, True))
 
@@ -955,6 +955,44 @@ PRODUCT_CANVAS = {
     # Default fallback
     "default":        {"front": (cm_to_px(30), cm_to_px(30)), "back": (cm_to_px(30), cm_to_px(30)), "pocket": (cm_to_px(9), cm_to_px(9))},
 }
+
+# Kids aged 1-4 get a smaller print area: 16 x 16 cm for front and back (owner request, 2026-10-14).
+# The age comes from the size in the SKU (KidsTee_Blk34 -> "3-4", Birthday1KidsTee_Wht12 -> "1-2").
+# Pocket and sleeve zones keep their own sizes. Applies to the products whose SKU sizes are age RANGES
+# (1-2, 3-4, 5-6 ...): kids T-shirt, kids hoodie and sleepsuit, plus rainsuits (no product key of their own, so
+# matched by SKU prefix). Football shorts are NOT included: their sizes are single ages (6, 8, 10, 12), so a code
+# like "12" means age 12, not 1-2, and no shorts for ages 1-4 exist.
+# A size such as 4-5 is not "up to 4", so it keeps the normal size.
+SMALL_KIDS_PRODUCTS     = ("kidstshirt", "kidshoodie", "sleepsuit")
+SMALL_KIDS_SKU_PREFIXES = ("Rainsuit",)
+SMALL_KIDS_MAX_AGE      = 4
+SMALL_KIDS_CM           = 16
+
+def kids_upper_age(sku):
+    """Upper age of the SKU's age size ('3-4' -> 4, '12-13' -> 13), or None when the size is not an age range."""
+    import re as _re
+    # Read the digits at the end of the SKU ("..._Pnk12", "..._SBlue23", "..._Wht1213") rather than relying on
+    # the colour-code table, which mis-splits colour names it does not know (SBlue23 -> size "e23").
+    m = _re.search(r"(\d+)$", (sku or "").split("_")[-1])
+    if not m or len(m.group(1)) < 2:
+        return None
+    digits = m.group(1)
+    mid = len(digits) // 2
+    lo, hi = int(digits[:mid]), int(digits[mid:])
+    return hi if hi > lo else None     # "1-0" / "1-1" are really single ages (10, 11), not a range
+
+def get_product_canvas(sku, product):
+    """PRODUCT_CANVAS entry for this SKU: the product's sheet size, except kids aged 1-4 (16 x 16 cm front/back)."""
+    canvas = PRODUCT_CANVAS.get(product, PRODUCT_CANVAS["default"])
+    if product in SMALL_KIDS_PRODUCTS or (sku or "").startswith(SMALL_KIDS_SKU_PREFIXES):
+        age = kids_upper_age(sku)
+        if age is not None and age <= SMALL_KIDS_MAX_AGE:
+            side = cm_to_px(SMALL_KIDS_CM)
+            canvas = dict(canvas)
+            for z in ("front", "back"):
+                if z in canvas:
+                    canvas[z] = (side, side)
+    return canvas
 
 # ─── SKU PREFIX → PRODUCT KEY — from owner Canvases.xlsx ─────────────────────
 SKU_MAP = [
@@ -3810,8 +3848,12 @@ def fetch_orders(limit=None, order_id_filter=None, sku_filter=None, multizone=Fa
     conn.close()
     return rows
 
+NO_MARK = False   # set by --no-mark: test exports must not touch the live Topaz_Processed flags
+
 def mark_processed(detail_id):
     """Mark a single order detail row as processed by the automation."""
+    if NO_MARK:
+        return
     conn = get_db()
     conn.cursor().execute("""
         UPDATE tblCustomOrderDetails
@@ -4261,12 +4303,14 @@ if __name__ == "__main__":
     parser.add_argument("--font-filter",   type=str, default=None, help="Comma-separated font name substrings e.g. 'Mermaid Font,Block Font'")
     parser.add_argument("--hours",         type=int, default=None, help="Only process orders added in the last N hours e.g. --hours 2")
     parser.add_argument("--with-images",   action="store_true",    help="Only process orders that have a customer image upload")
+    parser.add_argument("--no-mark",       action="store_true",    help="Test mode: build the PSDs but never write Topaz_Processed to the database (use with --output)")
     parser.add_argument("--daemon",        action="store_true",    help="Run continuously, polling for new orders every 30 seconds")
     parser.add_argument("--interval",      type=int, default=30,   help="Poll interval in seconds when running as daemon (default: 30)")
     args = parser.parse_args()
 
     DPI       = args.dpi
     PX_PER_CM = DPI / 2.54
+    NO_MARK   = args.no_mark
 
     batch_kwargs = dict(
         limit          = args.limit,
