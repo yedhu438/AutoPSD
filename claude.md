@@ -160,6 +160,7 @@ matches every real template file's actual pixel dimensions on disk.
 | shoebag | front | 23 | 14 | 2898 | 1764 |
 | shoebag2 | front | 14 | 14 | 1764 | 1764 |
 | stringbag | front | 22 | 24 | 2772 | 3024 |
+| pebag | front | 22 | 24 | 2772 | 3024 |
 | knittingbag | front | 25 | 21 | 3150 | 2646 |
 | buckethat | front | 11 | 4 | 1386 | 504 |
 | beanie | front | 9.5 | 4.5 | 1197 | 567 |
@@ -184,6 +185,13 @@ These are the values the live code actually uses today.
 
 Any SKU whose product can't be detected falls back to `default` — it is
 **never** a hard failure (see section 8).
+
+### PE bags: 22 × 24 cm for every design (owner request, 2026-10-14)
+`detect_product()` maps **any SKU containing "PEBag"** (`AnyTxtPEBag_`, `PEBagCustom_`, `PEBagBundle_`,
+`FBall01/02/03PEBag_`, `Swim02PEBag_` …) to the `pebag` product (22 × 24 cm = 2772 × 3024 px), checked
+before the SKU prefix table so the generic `AnyTxt` catch-all (adult T-shirt, 30 × 30 cm) can no longer
+claim them. Before this only `FBall01PEBag_` had the size; `AnyTxtPEBag_` (1,339 rows a year) came out
+30 × 30 cm. Embroidery PE bags (`PEBag_…EMB`) get it too but are skipped by the pipeline anyway.
 
 ### Kids aged 1-4: 16 × 16 cm (owner request, 2026-10-14)
 For kids aged 1-4 the **front and back** canvas is **16 × 16 cm = 2016 × 2016 px**
@@ -733,6 +741,7 @@ Done while moving production to a new PC (nothing here changes the database sche
   the given size, label inside the file, text under the image, letters centred by their visible
   edges (section 12). Verified on a full day of orders (62 built, 0 failed, every size right).
 - **Kids aged 1-4 → 16 × 16 cm** front/back for kids tees, sleepsuits and rainsuits (section 4).
+- **PE bags → 22 × 24 cm** for every design via the new `pebag` product (section 4).
 - **`--no-mark` test switch** in `batch_processor.py` (section 19) — build PSDs without writing to the DB.
 - **Setup script:** `migration/setup_new_pc.ps1` now installs `VarsanyDaemon` as *manual* start (a reboot
   can no longer start it before cutover); `-GoLive` switches it to auto-start and starts it.

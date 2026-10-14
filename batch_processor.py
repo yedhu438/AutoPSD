@@ -935,6 +935,7 @@ PRODUCT_CANVAS = {
     "shoebag":        {"front": (cm_to_px(23), cm_to_px(14))},
     "shoebag2":       {"front": (cm_to_px(14), cm_to_px(14))},
     "stringbag":      {"front": (cm_to_px(22), cm_to_px(24))},
+    "pebag":          {"front": (cm_to_px(22), cm_to_px(24))},   # PE bag, every design (AnyTxtPEBag_, PEBagCustom_, FBall0xPEBag_ ...)
     "knittingbag":    {"front": (cm_to_px(25), cm_to_px(21))},
     # Accessories
     "buckethat":      {"front": (cm_to_px(11), cm_to_px(4))},
@@ -1074,7 +1075,7 @@ SKU_MAP = [
     # Football shorts
     ("FootballShorts_",               "footballshorts"),
     # PE Bag (22×24 — same canvas as string bag)
-    ("FBall01PEBag",                  "stringbag"),
+    ("FBall01PEBag",                  "pebag"),
     # Hand Towel (17×17 — same canvas as golf towel)
     ("HandAnyTxtTwl",                 "golftowel"),
     # Legsuit (15×17 — same canvas as baby vest)
@@ -1413,6 +1414,10 @@ def detect_product(sku):
     """
     if not sku:
         return "default"
+    # PE bags: any design prefix (AnyTxtPEBag_, PEBagCustom_, FBall02PEBag_, ...) is a 22 x 24 cm PE bag.
+    # Checked first so the generic "AnyTxt" catch-all (adult T-shirt) can never claim them.
+    if "pebag" in sku.lower():
+        return "pebag"
     # Longest-prefix match — most specific entry wins over generic catch-alls like "AnyTxt"
     for prefix, product_key in sorted(SKU_MAP, key=lambda x: -len(x[0])):
         if sku.startswith(prefix):
