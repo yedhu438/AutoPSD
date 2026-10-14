@@ -2,7 +2,7 @@ const {app,core,action,constants} = require("photoshop");
 const uxp = require("uxp");
 const fs  = uxp.storage.localFileSystem;
 
-const PLUGIN_VERSION = "v3.8-multi-slot-template";
+const PLUGIN_VERSION = "v3.10b-fill-width";
 const POLL_MS   = 3000;
 const LABEL_PX  = 126;  // 1cm at 320dpi (halved from 2cm)
 const GAP_PX    = 126;  // 1cm gap between zones
@@ -10,6 +10,8 @@ const CANVAS_W  = 3780; // default canvas width px
 
 let VARSANY_ROOT=null, DATA_FOLDER=null, JOBS_FOLDER=null, DONE_FOLDER=null, ERROR_FOLDER=null;
 let processing = false;
+let TRACE = [];   // layout numbers of the current job; written into the done/error marker so a run can be debugged without screenshots
+function trace(m){ TRACE.push(m); if(TRACE.length > 80) TRACE.shift(); }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function ts(){const d=new Date(),p=n=>String(n).padStart(2,"0");return`${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;}
@@ -134,6 +136,13 @@ async function moveLayerToY(currentY, targetY){
     to:{_obj:"offset",horizontal:{_unit:"pixelsUnit",_value:0},vertical:{_unit:"pixelsUnit",_value:delta}}}]);
 }
 
+// Move the active layer sideways by dx pixels
+async function moveLayerByX(dx){
+  if(Math.abs(dx) < 1) return;
+  await bp([{_obj:"move",_target:[{_ref:"layer",_enum:"ordinal",_value:"targetEnum"}],
+    to:{_obj:"offset",horizontal:{_unit:"pixelsUnit",_value:dx},vertical:{_unit:"pixelsUnit",_value:0}}}]);
+}
+
 // Get layer bounds in pixels
 async function getLayerBounds(){
   const r=await bp([{_obj:"get",_target:[{_ref:"layer",_enum:"ordinal",_value:"targetEnum"}],_options:{dialogOptions:"dontDisplay"}}]);
@@ -204,36 +213,104 @@ async function addLabel(labelText, yTop, canvasW){
 // ── Process one zone: place image + text at given Y offset ────────────────────
 // Returns the bottom Y of the zone content
 async function processZone(doc, zone, data, imgEntry, yOffset, zoneW, zoneH, res, alignLeft=false, copyIdx=0){
-  let zoneBottom = yOffset;
+  // FILL-WIDTH / TRIMMED-HEIGHT LAYOUT (v3.10)
+  // Width: the content fills the zone width (side margin MARGIN_PX), text included.
+  // Height: the block is only as tall as its content (+ EDGE_PX above and below) - no empty space - but never
+  // taller than the given zone (zoneH, label strip included): the image and text are fitted INSIDE the
+  // design area areaH = zoneH - LABEL_PX, text under the image (designer rule). A kids tee (2898x3780) whose
+  // content fills the height is exactly 2898x3780; short text gives a short block. Returns the bottom of the block.
+  const MARGIN_PX = 38;    // side margin around the image
+  const TEXT_GAP  = 63;    // gap between image and text (0.5cm)
+  const areaH     = Math.max(zoneH - LABEL_PX, 200);
+  const EDGE_PX   = 38;    // content stays this far from the top and bottom edge of the design area (0.3cm)
+  const fitH      = Math.max(areaH - EDGE_PX*2, 100);   // height the image + text may actually use
+  const areaTop   = yOffset + EDGE_PX;
+  const hasText   = !!(data.text_lines && data.text_lines.length);
+  // text may use at most this much height: 30% of the usable height when there is an image too, else all of it
+  const maxTextH  = Math.round(fitH * (imgEntry ? 0.30 : 1.0));
+  let textName = null, textH = 0, sizePt = 100;
 
-  // Place image if available
+  // ── 1. TEXT first: width rule (80% of zone width), then a height cap, so we know the room left for the image ─
+  if(hasText){
+    textName = "Text_"+zone+"_"+Date.now();
+    const text = data.text_lines.join("\r");
+    const hex  = data.colour_hex||"";
+    const useSvgColour = !hex;   // premium SVG colour fonts (Football, Camo, ...): Photoshop renders their own texture
+    const cr=hex?parseInt(hex.slice(1,3),16):255, cg=hex?parseInt(hex.slice(3,5),16):255, cb=hex?parseInt(hex.slice(5,7),16):255;
+    const colourProp = useSvgColour ? {} : {color:{_obj:"RGBColor",red:cr,green:cg,blue:cb}};
+    const fontPS     = data.font_ps_name  || "Arial-BoldMT";
+    const fontFamily = data.font_family   || "Arial";
+    const fontStyle  = data.font_style    || "Bold";
+    const targetPx   = Math.max(zoneW - MARGIN_PX*2, 100);   // fill the zone width
+    const styleFor   = (pt) => buildTextStyleRanges(text,fontPS,fontFamily,fontStyle,colourProp,pt);
+    const applySize  = async (pt) => {
+      await bp([{_obj:"set",null:{_ref:[{_ref:"layer",_name:textName}]},
+        to:{_obj:"textLayer",textKey:text,textStyleRange:styleFor(pt)}}]);
+    };
+
+    await bp([{_obj:"make",_target:[{_ref:"textLayer"}],
+      using:{_obj:"textLayer",textKey:text,
+        textClickPoint:{_obj:"paint",horizontal:{_unit:"percentUnit",_value:50},vertical:{_unit:"percentUnit",_value:50}},
+        textStyleRange:styleFor(100),
+        paragraphStyleRange:[{_obj:"paragraphStyleRange",from:0,to:text.length,
+          paragraphStyle:{_obj:"paragraphStyle",alignment:{_enum:"alignmentType",_value:"center"}}
+        }]
+      }
+    }]);
+    await bp([{_obj:"set",null:{_ref:[{_enum:"ordinal",_value:"targetEnum",_ref:"layer"}]},to:{_obj:"layer",name:textName}}]);
+
+    // width rule: largest size whose widest line is 80% of the zone width (designer rule)
+    for(let pass=0;pass<2;pass++){
+      const lb=await getLayerBounds();
+      sizePt=Math.min(Math.max(sizePt*(targetPx/(lb.w||1)),20),1200);
+      await applySize(sizePt);
+    }
+    // height cap: many lines / blank lines can make the block taller than its share of the area; shrink to fit
+    let tb = await getLayerBounds();
+    if(tb.h > maxTextH){
+      for(let pass=0; pass<3 && tb.h > maxTextH*1.01; pass++){
+        sizePt=Math.max(sizePt*(maxTextH/(tb.h||1)),6);
+        await applySize(sizePt);
+        tb = await getLayerBounds();
+      }
+      log("Text height-capped ("+zone+"): "+Math.round(sizePt)+"pt, block "+Math.round(tb.h)+"px (limit "+maxTextH+"px)");
+    }
+    textH = tb.h;
+    trace(zone+" area="+zoneW+"x"+areaH+" text size="+Math.round(sizePt)+"pt block="+Math.round(tb.w)+"x"+Math.round(tb.h)+" (limit h="+maxTextH+")");
+    // horizontal placement now, while this text layer is still the active one (pocket = left, others = centre).
+    // Photoshop's "align to canvas" centres the text FRAME (letter side-spacing included), which leaves the visible
+    // letters a few px off - so place by the layer's own bounds (the letters) instead.
+    const dsz = await getDocSize();
+    const tb2 = await getLayerBounds();
+    await moveLayerByX((alignLeft ? MARGIN_PX : Math.round((dsz.w - tb2.w)/2)) - tb2.left);
+  }
+
+  // ── 2. IMAGE: fit into what is left of the area above the text ──────────────────────────────
+  let imgH = 0;
   if(imgEntry){
+    const availH = Math.max(fitH - (hasText ? textH + TEXT_GAP : 0), 100);
     const imgToken = fs.createSessionToken(imgEntry);
     await bp([{_obj:"placeEvent",null:{_path:imgToken,_kind:"local"},freeTransformCenterState:{_enum:"quadCenterState",_value:"QCSAverage"}}]);
 
     const pb = await getLayerBounds();
     const lw = pb.w, lh = pb.h;
 
-    const MARGIN_PX = 38;
     if(lw>0 && lh>0){
-      const scalePct = Math.min((zoneW - MARGIN_PX*2)/lw, zoneH/lh)*100;
+      const scalePct = Math.min((zoneW - MARGIN_PX*2)/lw, availH/lh)*100;
       await bp([{_obj:"transform",null:{_ref:[{_ref:"layer",_enum:"ordinal",_value:"targetEnum"}]},
         freeTransformCenterState:{_enum:"quadCenterState",_value:"QCSAverage"},
         width:{_unit:"percentUnit",_value:scalePct},height:{_unit:"percentUnit",_value:scalePct},
         constrainProportions:true,interfaceIconFrameDimmed:{_enum:"interpolationType",_value:"bicubicAutomatic"}}]);
 
       // Pocket = left-aligned, others = centre
-      if(alignLeft){
-        await bp([{_obj:"align",null:{_ref:[{_enum:"ordinal",_value:"targetEnum",_ref:"layer"}]},
-          using:{_enum:"alignDistributeSelector",_value:"ADSLefts"},alignToCanvas:true}]);
-      } else {
-        await bp([{_obj:"align",null:{_ref:[{_enum:"ordinal",_value:"targetEnum",_ref:"layer"}]},
-          using:{_enum:"alignDistributeSelector",_value:"ADSCentersH"},alignToCanvas:true}]);
-      }
+      await bp([{_obj:"align",null:{_ref:[{_enum:"ordinal",_value:"targetEnum",_ref:"layer"}]},
+        using:{_enum:"alignDistributeSelector",_value:alignLeft?"ADSLefts":"ADSCentersH"},alignToCanvas:true}]);
 
+      // vertical: image sits at the top of the block; the block is trimmed to its content below
       const pb2 = await getLayerBounds();
-      await moveLayerToY(pb2.top, yOffset);
-      zoneBottom = yOffset + pb2.h;
+      imgH = pb2.h;
+      trace(zone+" image src="+Math.round(lw)+"x"+Math.round(lh)+" scale="+Math.round(scalePct)+"% -> "+Math.round(pb2.w)+"x"+Math.round(pb2.h)+" availH="+Math.round(availH));
+      await moveLayerToY(pb2.top, areaTop);
     }
 
     await bp([{_obj:"rasterizeLayer",null:{_ref:[{_enum:"ordinal",_value:"targetEnum",_ref:"layer"}]}}]);
@@ -251,10 +328,10 @@ async function processZone(doc, zone, data, imgEntry, yOffset, zoneW, zoneH, res
         await bp([{_obj:"placeEvent",null:{_path:previewToken,_kind:"local"},freeTransformCenterState:{_enum:"quadCenterState",_value:"QCSAverage"}}]);
         // Rasterize FIRST — before any transform to avoid Smart Object issues
         await bp([{_obj:"rasterizeLayer",null:{_ref:[{_enum:"ordinal",_value:"targetEnum",_ref:"layer"}]}}]);
-        // Scale to fit zone — use zoneW not docW
+        // Scale to fit the design area — use zoneW not docW
         const ppb = await getLayerBounds();
         if(ppb.w>0&&ppb.h>0){
-          const pscale = Math.min((zoneW-MARGIN_PX*2)/ppb.w, zoneH/ppb.h)*100;
+          const pscale = Math.min((zoneW-MARGIN_PX*2)/ppb.w, areaH/ppb.h)*100;
           await bp([{_obj:"transform",null:{_ref:[{_ref:"layer",_enum:"ordinal",_value:"targetEnum"}]},
             freeTransformCenterState:{_enum:"quadCenterState",_value:"QCSAverage"},
             width:{_unit:"percentUnit",_value:pscale},height:{_unit:"percentUnit",_value:pscale},
@@ -273,95 +350,22 @@ async function processZone(doc, zone, data, imgEntry, yOffset, zoneW, zoneH, res
     }
   }
 
-    // Set text if available
-  if(data.text_lines?.length){
-    const textLayerName = "Text_"+zone+"_"+Date.now();
-    const text = data.text_lines.join("\r");
-    const hex  = data.colour_hex||"";
-    const useSvgColour = !hex;
-    const cr=hex?parseInt(hex.slice(1,3),16):255,cg=hex?parseInt(hex.slice(3,5),16):255,cb=hex?parseInt(hex.slice(5,7),16):255;
-    const colourProp = useSvgColour ? {} : {color:{_obj:"RGBColor",red:cr,green:cg,blue:cb}};
-    const fontPS     = data.font_ps_name  || "Arial-BoldMT";
-    const fontFamily = data.font_family   || "Arial";
-    const fontStyle  = data.font_style    || "Bold";
-
-    // Auto-size to ~80% zone width
-    const targetPx = zoneW * 0.80;
-    let sizePt = 100;
-
-    if(useSvgColour){
-      // Premium SVG colour fonts (Football, Camo, Smart Kids etc.):
-      // Create editable type layer directly in the main doc — no colour override,
-      // Photoshop renders the font's built-in SVG texture natively.
-      await bp([{_obj:"make",_target:[{_ref:"textLayer"}],
-        using:{_obj:"textLayer",textKey:text,
-          textClickPoint:{_obj:"paint",horizontal:{_unit:"percentUnit",_value:50},vertical:{_unit:"percentUnit",_value:50}},
-          textStyleRange:buildTextStyleRanges(text,fontPS,fontFamily,fontStyle,{},100),
-          paragraphStyleRange:[{_obj:"paragraphStyleRange",from:0,to:text.length,
-            paragraphStyle:{_obj:"paragraphStyle",alignment:{_enum:"alignmentType",_value:"center"}}
-          }]
-        }
-      }]);
-      await bp([{_obj:"set",null:{_ref:[{_enum:"ordinal",_value:"targetEnum",_ref:"layer"}]},to:{_obj:"layer",name:textLayerName}}]);
-      for(let pass=0;pass<2;pass++){
-        const lb=await getLayerBounds();
-        sizePt=Math.min(Math.max(sizePt*(targetPx/(lb.w||1)),20),400);
-        await bp([{_obj:"set",null:{_ref:[{_ref:"layer",_name:textLayerName}]},
-          to:{_obj:"textLayer",textKey:text,
-            textStyleRange:buildTextStyleRanges(text,fontPS,fontFamily,fontStyle,{},sizePt)
-          }
-        }]);
-      }
-    } else {
-      await bp([{_obj:"make",_target:[{_ref:"textLayer"}],
-        using:{_obj:"textLayer",textKey:text,
-          textClickPoint:{_obj:"paint",horizontal:{_unit:"percentUnit",_value:50},vertical:{_unit:"percentUnit",_value:50}},
-          textStyleRange:buildTextStyleRanges(text,fontPS,fontFamily,fontStyle,colourProp,100),
-          paragraphStyleRange:[{_obj:"paragraphStyleRange",from:0,to:text.length,
-            paragraphStyle:{_obj:"paragraphStyle",alignment:{_enum:"alignmentType",_value:"center"}}
-          }]
-        }
-      }]);
-      await bp([{_obj:"set",null:{_ref:[{_enum:"ordinal",_value:"targetEnum",_ref:"layer"}]},to:{_obj:"layer",name:textLayerName}}]);
-      for(let pass=0;pass<2;pass++){
-        const lb=await getLayerBounds();
-        sizePt=Math.min(Math.max(sizePt*(targetPx/(lb.w||1)),20),400);
-        await bp([{_obj:"set",null:{_ref:[{_ref:"layer",_name:textLayerName}]},
-          to:{_obj:"textLayer",textKey:text,
-            textStyleRange:buildTextStyleRanges(text,fontPS,fontFamily,fontStyle,colourProp,sizePt)
-          }
-        }]);
-      }
-    }
-
-    // Pocket = left-aligned text, others = centre
-    if(alignLeft){
-      await bp([{_obj:"align",null:{_ref:[{_enum:"ordinal",_value:"targetEnum",_ref:"layer"}]},
-        using:{_enum:"alignDistributeSelector",_value:"ADSLefts"},alignToCanvas:true}]);
-    } else {
-      await bp([{_obj:"align",null:{_ref:[{_enum:"ordinal",_value:"targetEnum",_ref:"layer"}]},
-        using:{_enum:"alignDistributeSelector",_value:"ADSCentersH"},alignToCanvas:true}]);
-    }
-
-    // Position: directly below image with small margin, or just 1cm below yOffset if no image
-    const textBounds = await getLayerBounds();
-    let textY;
-    if(imgEntry){
-      const margin = Math.round(LABEL_PX * 0.5); // gap below image
-      textY = zoneBottom + margin;
-    } else {
-      // No image — place text 1cm (126px) below the zone start (just under the label)
-      textY = yOffset + LABEL_PX;
-    }
-    await moveLayerToY(textBounds.top, textY);
-
-    // Update zoneBottom to include text
-    const newTextBounds = await getLayerBounds();
-    zoneBottom = Math.max(zoneBottom, newTextBounds.bottom);
-    log("Text: "+zone+" ("+Math.round(sizePt)+"pt) bottom:"+zoneBottom);
+  // ── 3. Move the text to its final spot: under the image, or centred in the area when there is no image ─────
+  if(hasText){
+    const underImage = imgEntry && imgH > 0;
+    const textTop = underImage ? areaTop + imgH + TEXT_GAP : areaTop;
+    await bp([{_obj:"select",_target:[{_ref:"layer",_name:textName}],makeVisible:false}]);
+    const before = await getLayerBounds();
+    await moveLayerToY(before.top, textTop);
+    const after = await getLayerBounds();
+    trace(zone+" text: "+Math.round(sizePt)+"pt h="+Math.round(textH)+" wanted top="+Math.round(textTop)+" (was "+Math.round(before.top)+", now "+Math.round(after.top)+")");
+    log("Text: "+zone+" ("+Math.round(sizePt)+"pt) top:"+Math.round(after.top)+" h:"+Math.round(textH));
   }
 
-  return zoneBottom;
+  const contentH = (imgEntry && imgH > 0) ? imgH + (hasText ? TEXT_GAP + textH : 0) : textH;
+  const usedH    = Math.min(areaH, Math.round(contentH + EDGE_PX*2));
+  trace(zone+" block: content="+Math.round(contentH)+" used="+usedH+" of area "+areaH);
+  return yOffset + usedH;
 }
 
 // ── Main job processor ────────────────────────────────────────────────────────
@@ -370,6 +374,7 @@ async function processJob(jobEntry){
   try{job=await readJSON(jobEntry);orderId=job.order_id||orderId;}
   catch(e){await writeJSON(ERROR_FOLDER,jobEntry.name,{order_id:orderId,error:"Parse: "+e.message,failed_at:ts()});await jobEntry.delete();return;}
   log("Processing: "+orderId);
+  TRACE = [];
 
   const isCombined = job.combined === true;
   let tplEntry, imgEntries={}, outEntry;
@@ -812,10 +817,10 @@ async function processJob(jobEntry){
   },{commandName:"Process "+orderId});
 
   if(success){
-    await writeJSON(DONE_FOLDER,jobEntry.name,{order_id:orderId,output_filename:outEntry.name,completed_at:ts()});
+    await writeJSON(DONE_FOLDER,jobEntry.name,{order_id:orderId,output_filename:outEntry.name,completed_at:ts(),plugin:PLUGIN_VERSION,trace:TRACE});
     await jobEntry.delete();log("Done: "+orderId);
   }else{
-    await writeJSON(ERROR_FOLDER,jobEntry.name,{order_id:orderId,error:errorMsg,failed_at:ts()});
+    await writeJSON(ERROR_FOLDER,jobEntry.name,{order_id:orderId,error:errorMsg,failed_at:ts(),plugin:PLUGIN_VERSION,trace:TRACE});
     try{await jobEntry.delete();}catch(x){}
     log("Error: "+orderId+" — "+errorMsg,true);
   }
