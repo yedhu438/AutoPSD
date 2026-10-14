@@ -1,14 +1,18 @@
 # Moving the Varsany automation to another PC
 
-Verified against the live PC on **2026-10-13**. For the *current* system this replaces `SETUP_GUIDE.md`
+Verified against the live PC on **2026-10-14**. For the *current* system this replaces `SETUP_GUIDE.md`
 (that guide describes an older VPS layout: `C:\Varsany`, Python 3.11, mapped W:/Z: drives).
-Nothing in this file is a secret. Secrets travel only in the git-ignored `migration\bundle\` folder.
+Nothing in this file is a secret.
+
+**The plan:** the code moves through GitHub. Everything git does not carry (the jersey template, the fonts, `.env`,
+the B2 key, `nssm.exe`/`rclone.exe`, the service settings, the pinned package list) sits in the git-ignored
+`migration\bundle\` folder, which you copy across by hand.
 
 ## What actually runs today
 
 | Piece | How it is set up | In git? | How it moves |
 |---|---|---|---|
-| Code | `C:\gimpTest` | yes (commit first, see A1) | git, or copy the folder |
+| Code | `C:\gimpTest` | yes | `git clone` from GitHub (push first, see A1) |
 | Secrets + paths | `.env` | no | bundle |
 | Python | 3.14.x installed for one Windows user; 49 pinned packages | no | `setup_new_pc.ps1` (from `requirements.lock.txt`) |
 | Daemon | Windows service `VarsanyDaemon` (NSSM), runs **as that Windows user**: `-u C:\gimpTest\batch_processor.py --daemon --date-after 2026-07-18`, output to `daemon.log`, restarts if it exits | no | `setup_new_pc.ps1` (settings come from the bundle) |
@@ -33,11 +37,12 @@ mislead on another one).
 
 ## A. On the old PC
 
-1. **Commit the code.** Four files are modified but uncommitted (`batch_processor.py`, `uxp-plugin/index.js`,
-   `uxp-plugin/manifest.json`, `sync_to_b2.bat`) and `restart_daemon.bat` plus this `migration\` folder are new.
-   A plain `git clone` of the last commit would give the new PC the older plugin manifest and a `sync_to_b2.bat`
-   that the SYSTEM account cannot run. Commit and push, or skip git and copy the whole folder.
-   The repo is public: never force-add `.env`, `migration\bundle\` or `jobs\` (all git-ignored).
+1. **Push the code to GitHub.** The working code is already committed locally: the four production files that had
+   only been running uncommitted, `restart_daemon.bat` and this kit. From `C:\gimpTest`:
+   ```powershell
+   git push origin master
+   ```
+   The repo is public. `.env`, `migration\bundle\` and `jobs\` are git-ignored: never force-add them.
 2. **Build or refresh the bundle** from a *normal* Windows PowerShell window (not from inside the Claude app, whose
    view of `%APPDATA%` can be stale; that is why a bundle built there leaves the B2 key file out):
    ```powershell
@@ -45,8 +50,8 @@ mislead on another one).
    ```
    Unchanged files are skipped, so a re-run is quick. It collects `.env`, the service settings, the pinned package list,
    `template\`, `nssm.exe`, `rclone.exe`, every custom font, `rclone.conf`, and writes `SHA256SUMS.txt`.
-3. **Copy `C:\gimpTest\migration\bundle`** (about 1 GB) to the new PC by USB or LAN. It holds the DB password and the
-   B2 key: delete the copies afterwards.
+3. **Copy `C:\gimpTest\migration\bundle`** (about 1 GB) to the new PC by USB, LAN or OneDrive. It is the only thing that
+   does not come from GitHub, and it holds the DB password and the B2 key: delete the copies afterwards.
 
 ## B. On the new PC
 
@@ -57,8 +62,14 @@ mislead on another one).
    winget install -e --id Google.Chrome
    winget install -e --id Git.Git
    ```
-2. **Put the code at `C:\gimpTest`** (`git clone https://github.com/yedhu438/gimpTest.git C:\gimpTest`, or copy the
-   folder) and the bundle at `C:\gimpTest\migration\bundle`.
+2. **Clone the code, then paste the bundle.**
+   ```powershell
+   git clone https://github.com/yedhu438/gimpTest.git C:\gimpTest
+   ```
+   Paste the bundle folder you copied so that it ends up at `C:\gimpTest\migration\bundle`.
+   (Hand-copying instead of using the bundle? Template: `C:\gimpTest\template\`. `.env`: `C:\gimpTest\.env`. Fonts:
+   `py -3.14 C:\gimpTest\install_fonts.py --source <folder with the fonts>` from an admin PowerShell. The setup script
+   still wants the bundle's `config\` folder for the service settings and the pinned packages.)
 3. **Get the DB host to allow this PC's public IP** on port 1433. Find it with
    `(Invoke-RestMethod https://api.ipify.org)`.
 4. **Match the time zone:** `tzutil /s "GMT Standard Time"`. For unattended running also turn off sleep and sign in
@@ -77,9 +88,9 @@ mislead on another one).
    2. Preferences > Plugins > turn on Developer Mode if offered (needs admin; restart Photoshop).
    3. UXP Developer Tools > Add Plugin > `C:\gimpTest\uxp-plugin\manifest.json` > Load
       (or Plugins > Development > Load Unpacked Plugin, as in the old SETUP_GUIDE).
-   4. Open the **Varsany Orders** panel. It should log `Ready: C:\gimpTest`. If not, click *Set Root Folder* and pick
-      `C:\gimpTest` (this writes a fresh `uxp_token.txt`).
-   5. Leave Photoshop open and not minimised, in the signed-in session.
+   4. Open the **Varsany Orders** panel from the Plugins menu. It should log `Ready: C:\gimpTest`. If not, click
+      *Set Root Folder* and pick `C:\gimpTest` (this writes a fresh `uxp_token.txt`).
+   5. Leave Photoshop open and not minimised, in the signed-in session, with no hand-made documents (see E).
 7. **Pilot, without touching production.** Push one already-finished order through to a throwaway folder:
    ```powershell
    cd C:\gimpTest
@@ -122,14 +133,21 @@ The DB flags are the only shared state, so rolling back means swapping the switc
 and `schtasks /change /tn VarsanyB2Sync /disable`. Old PC: `sc.exe config VarsanyDaemon start= auto`,
 `net start VarsanyDaemon` and `schtasks /change /tn VarsanyB2Sync /enable`.
 
-## E. Known issues you will carry over (as of 2026-10-13)
+## E. Operating notes and known issues (as of 2026-10-14)
 
-- **The plugin must be re-loaded after a Photoshop restart.** On the old PC no PSD has been written since
-  2026-10-12 around 14:33, about 30 jobs sit in `jobs\`, and every order logs `UXP timed out`; Photoshop was restarted
-  at 14:26 today. That fits an unpacked plugin that was not re-loaded (not confirmed: the panel state cannot be read
-  from outside). On whichever PC is live, after any Photoshop restart re-load the plugin and check the panel says
-  `Ready`. Packaging it as a .ccx (UXP Developer Tools > Package) might make it survive restarts; untested.
-- The daemon logs `FAILED ... UXP timed out` after 10 minutes even when Photoshop finishes later, so those orders are
+- **The plugin must be loaded again after every Photoshop restart, and the Varsany Orders panel must be open.** It is
+  loaded by hand as an unpacked developer plugin, so a restart silently turns it off while the daemon keeps submitting
+  jobs and logging `UXP timed out`. This is what stopped the old PC: nothing was produced from 2026-10-12 14:33 until
+  the plugin was loaded again, and Photoshop had been restarted several times on 10-13. Packaging the plugin as a .ccx
+  (UXP Developer Tools > Package) so it loads by itself might fix this for good; untested.
+- **Give the plugin a Photoshop session to itself.** It purges caches (and with them the undo history) after every job
+  and creates and closes its own documents, so hand-made documents open in the same session can be disturbed.
+- **If the plugin was down for a while, empty `jobs\` before loading it again.** The plugin takes one job file per
+  3-second poll in alphabetical order, while the daemon waits for one specific order and never deletes a job that
+  timed out. With a backlog the daemon times out on every order and the PSDs the plugin finishes later are never marked
+  done (the daemon clears stale done-markers when it re-submits). Move the old files out of `jobs\`, for example into
+  `Temp\jobs_stale_<date>\`; the daemon re-queues every still-pending order from the DB by itself.
+- The daemon logs `FAILED ... UXP timed out` after 10 minutes even when Photoshop finishes later, so such orders are
   re-submitted. Look for the PSD in `Output\` before concluding an order failed.
 - `daemon.log` and `batch_log.txt` grow without limit (about 2 GB each today).
 - `start_daemon.bat` in the repo is stale (a previous user's Python path and `--date-after 2026-07-10`). Do not use it:
