@@ -284,8 +284,9 @@ function Sync-Service {
 
     if ($svc) {
         $p = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName\Parameters" -ErrorAction SilentlyContinue
-        $detail = "$($svc.Status); args: $($p.AppParameters)"
-        if ($appParams -and $p -and $p.AppParameters -ne $appParams) { Add-Result 'Service' 'WARN' "$detail   (old PC used: $appParams)" }
+        $detail = "$($svc.Status), $($svc.StartType); args: $($p.AppParameters)"
+        if ($svc.Status -ne 'Running' -and $svc.StartType -eq 'Automatic') { Add-Result 'Service' 'WARN' "$detail   - a reboot would start it; before cutover: sc.exe config $ServiceName start= demand" }
+        elseif ($appParams -and $p -and $p.AppParameters -ne $appParams) { Add-Result 'Service' 'WARN' "$detail   (old PC used: $appParams)" }
         else { Add-Result 'Service' 'OK' $detail }
         return
     }
@@ -308,10 +309,11 @@ function Sync-Service {
     [void](Invoke-Nssm @('set', $ServiceName, 'AppStdout', $stdout))
     [void](Invoke-Nssm @('set', $ServiceName, 'AppStderr', $stdout))
     [void](Invoke-Nssm @('set', $ServiceName, 'AppExit', 'Default', 'Restart'))
-    [void](Invoke-Nssm @('set', $ServiceName, 'Start', 'SERVICE_AUTO_START'))
+    # manual start until -GoLive: an auto-start service would come up on the next reboot while the old PC still runs
+    [void](Invoke-Nssm @('set', $ServiceName, 'Start', 'SERVICE_DEMAND_START'))
     $plain = Read-SecretText "Windows password for $ServiceUser (the daemon service runs as this user, like on the old PC)"
     try { [void](Invoke-Nssm @('set', $ServiceName, 'ObjectName', $ServiceUser, $plain)) } finally { $plain = $null }
-    Add-Result 'Service' 'FIXED' "installed as $ServiceUser, auto-start, restart-on-exit - NOT started (use -GoLive at cutover)"
+    Add-Result 'Service' 'FIXED' "installed as $ServiceUser, manual start, restart-on-exit - NOT started (-GoLive sets auto-start and starts it)"
 }
 
 function Sync-B2 {
@@ -461,8 +463,9 @@ function Invoke-GoLive {
     Write-Host 'Starting the daemon here while the OLD PC is still running it makes both PCs process the same orders.' -ForegroundColor Yellow
     $ans = Read-Host "Type YES to confirm the OLD PC's VarsanyDaemon is STOPPED and set to Disabled"
     if ($ans -cne 'YES') { Add-Result 'Go live' 'FAIL' 'not confirmed - nothing was started'; return }
+    [void](Invoke-Nssm @('set', $ServiceName, 'Start', 'SERVICE_AUTO_START'))
     Start-Service -Name $ServiceName
-    Add-Result 'Service' 'FIXED' "$ServiceName started"
+    Add-Result 'Service' 'FIXED' "$ServiceName set to auto-start and started"
     if (-not $SkipB2) {
         [void](Invoke-Native 'schtasks.exe' @('/change', '/tn', $TaskName, '/enable'))
         [void](Invoke-Native 'schtasks.exe' @('/run', '/tn', $TaskName))

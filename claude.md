@@ -1,7 +1,7 @@
 # Varsany Print Automation — Project Knowledge Base
 
 > Business: Varsany / Fullymerched — Amazon custom print-on-demand
-> Last updated: 2026-07-16 (verified against live code — see section 21 for what changed)
+> Last updated: 2026-10-14 (layout rework + kids 1-4 canvas — see section 22; earlier changes in section 21)
 
 ---
 
@@ -185,6 +185,27 @@ These are the values the live code actually uses today.
 Any SKU whose product can't be detected falls back to `default` — it is
 **never** a hard failure (see section 8).
 
+### Kids aged 1-4: 16 × 16 cm (owner request, 2026-10-14)
+For kids aged 1-4 the **front and back** canvas is **16 × 16 cm = 2016 × 2016 px**
+instead of the product's normal size. `get_product_canvas(sku, product)` in
+`batch_processor.py` applies it (single-item and multi-item builders). It reads the age
+from the **trailing digits of the SKU** (`..._Pnk12` → 1-2, `..._SBlue23` → 2-3,
+`..._Blk34` → 3-4) and applies when the upper age is ≤ 4:
+
+| Product | Sizes that change | Rows in the year to Oct 2026 |
+|---|---|---|
+| Kids T-shirt (`kidstshirt`) | 1-2, 3-4 | 639 + 1,041 |
+| Sleepsuit (`sleepsuit`, `IWakeup_PJ…`) | 1-2, 2-3, 3-4 | 142 + 82 + 69 |
+| Rainsuit (SKU prefix `Rainsuit`, product `default`) | 2-3, 3-4 | 56 + 52 |
+
+- **Pocket and sleeve zones keep their own sizes** (pocket stays 9 × 9 cm).
+- A size such as 4-5 has upper age 5, so it keeps the normal size.
+- **Football shorts are deliberately excluded:** their size codes are single ages
+  (6, 8, 10, 12), so `..._12` means age 12 — not 1-2 — and none exist for ages 1-4.
+  Codes like `10` / `11` parse as "1-0" / "1-1" and are ignored (not a valid range).
+- The older label parser still shows odd sizes for colour names it does not know
+  (`SBlue23` → "E23"); cosmetic only, the canvas rule above does not use it.
+
 ---
 
 ## 5. Amazon Print Location Combos
@@ -252,9 +273,11 @@ actual hybrid decision logic in section 13 (this section previously said
 "rembg" was the mechanism; it's more nuanced than that).
 
 ### Font Sizing
-- Auto-fit: largest font where all text lines fit within canvas width and height
-- Short text (e.g. "I Love AI") → ~217pt
-- Long text → smaller, still fills canvas nicely
+- Text **fills the zone width** (side margin 38 px = 0.3 cm): the largest size at which the
+  widest line spans the width (plugin v3.10; it used to be 80% of the width)
+- If the block is then taller than the room it has — the whole usable zone height for
+  text-only orders, 30% of it when there is also an image — it is shrunk uniformly until it fits
+- So short text ("Tom") becomes very large and long text smaller; see section 12 for the height rule
 
 ### Text Line Breaks
 - Customer types line breaks on Amazon → stored as \n in database
@@ -458,6 +481,24 @@ with `psd-tools` this session):
   supporting graphic/Smart Object layers per slot (not name-distinguished
   per slot — same name can repeat across slots)
 
+**Layout rule (plugin v3.10b, `processZone` in `uxp-plugin/index.js`, 2026-10-14):**
+- Every zone is a **block**: a 126 px label strip at the top (the label is *inside* the file) plus a
+  design area. Blocks are stacked with a 126 px gap (quantity / multi-zone / multi-item orders), as before.
+- **Width:** content fills the zone width (38 px side margins), text included.
+- **Height:** each block is only as tall as its content (+ 38 px above and below) — **no empty space** —
+  but never taller than the given zone height. A kids tee (2898 × 3780) whose content fills the
+  height is exactly 2898 × 3780; a one-line name is a short block.
+- **Image + text:** image on top, text underneath (designer rule); the text is capped at 30% of the
+  usable height and the image is scaled into the rest. Text-only: the text may use all of it.
+- Text is placed by its **visible letters** (Photoshop's "align to canvas" centres the text frame and
+  leaves letters a few px off). Pocket zones are left-aligned.
+- The plugin writes its layout numbers (`trace`) and its version into each job's marker in
+  `done\{OrderID}.json` / `error\…` — read these to debug a build without screenshots.
+- The customer's spacing is still stripped (`parse_texts` strips every line), as before.
+- Why text goes under the image: the database holds **no position data** for text or image (only
+  text, font, colour, file names and Amazon's 400 × 400 preview picture), so the position the
+  customer chose cannot be reproduced.
+
 **Known performance issue (not yet fixed, root-caused this session):** this
 machine has no real GPU (`Microsoft Hyper-V Video` / `Microsoft Remote
 Display Adapter` only), so large-canvas compositing is fully CPU-bound. The
@@ -620,6 +661,13 @@ migration notes in section 19.
   machine-specific and won't come along with a `git clone`. A consolidated,
   verified-complete copy of all currently-used fonts exists at
   `C:\Users\VARHeist\Desktop\fonts` for this purpose.
+- **Test exports without touching production:** `python batch_processor.py --reprocess --no-mark --order <id,id> --output C:\gimpTest\Temp\<folder>`
+  builds the PSDs but `--no-mark` skips the only database write (`Topaz_Processed = 1`), so the
+  orders stay in the queue and nothing reaches `Output\`, B2 or the NAS. Use `--date YYYY-MM-DD`
+  instead of `--order` for a whole day.
+- **Nobody works by hand in the Photoshop session the plugin uses.** During a test run, clicking in
+  Photoshop stalled the plugin for ~14 minutes ("Failed to create new document"); the same run
+  went through cleanly with Photoshop left alone. Reload the plugin after every Photoshop restart.
 - **Antigravity:** Uses Google account login only —
   Yedhu@fullymerched.com (Microsoft) won't work — use personal Gmail
 
@@ -674,3 +722,23 @@ assumptions from before these existed:
   all logic into `uxp-plugin/index.js`, loaded via `<script src="index.js">`
   (section 12) — this is the version-safe pattern and should be used for
   any future plugin changes, never inline `<script>` content again.
+
+---
+
+## 22. Changelog (2026-10-14 — new PC + layout rework)
+
+Done while moving production to a new PC (nothing here changes the database schema):
+
+- **Layout:** plugin v3.10b — width filled edge to edge, height trimmed to the content and never above
+  the given size, label inside the file, text under the image, letters centred by their visible
+  edges (section 12). Verified on a full day of orders (62 built, 0 failed, every size right).
+- **Kids aged 1-4 → 16 × 16 cm** front/back for kids tees, sleepsuits and rainsuits (section 4).
+- **`--no-mark` test switch** in `batch_processor.py` (section 19) — build PSDs without writing to the DB.
+- **Setup script:** `migration/setup_new_pc.ps1` now installs `VarsanyDaemon` as *manual* start (a reboot
+  can no longer start it before cutover); `-GoLive` switches it to auto-start and starts it.
+- **Findings, not fixed:** (1) the database holds no text/image position data; (2) clicking in the
+  plugin's Photoshop session can stall it for minutes; (3) the new PC shut down unexpectedly four
+  times in two weeks (Kernel-Power 41, no memory pressure) and one 8 GB RAM module vanished from
+  Windows' view — hardware to be checked before it becomes the production machine;
+  (4) football kids hoodies (`FballN…KidsHood`) map to the adult hoodie canvas (25 × 25 cm) — open question;
+  (5) sizes shown as "E23" in labels, and football-shorts "12" shown as "1-2", are parser quirks.

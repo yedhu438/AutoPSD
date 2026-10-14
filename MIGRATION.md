@@ -80,8 +80,9 @@ mislead on another one).
    powershell -ExecutionPolicy Bypass -File C:\gimpTest\migration\setup_new_pc.ps1
    ```
    It verifies the bundle checksums, creates the folders, restores `.env` and the template, installs the pinned
-   packages and the fonts, installs the `VarsanyDaemon` service **without starting it** (it asks for the Windows
-   password), installs rclone and creates the B2 task **disabled**, then tests the DB login. Secrets are never printed.
+   packages and the fonts, installs the `VarsanyDaemon` service **without starting it and as manual-start, so a reboot
+   cannot start it either** (it asks for the Windows password), installs rclone and creates the B2 task **disabled**,
+   then tests the DB login. Secrets are never printed.
    Re-running is safe; `-DryRun` shows what it would do; `-Check` changes nothing and also works on the old PC.
 6. **Photoshop (manual, the script cannot do this):**
    1. Sign in to Creative Cloud and start Photoshop 2026. Restart it after the fonts were installed.
@@ -117,8 +118,8 @@ mislead on another one).
    ```powershell
    powershell -ExecutionPolicy Bypass -File C:\gimpTest\migration\setup_new_pc.ps1 -GoLive
    ```
-   It asks you to type `YES` (old daemon stopped and disabled), then starts `VarsanyDaemon` and enables + starts
-   `VarsanyB2Sync`.
+   It asks you to type `YES` (old daemon stopped and disabled), then sets `VarsanyDaemon` to auto-start and starts it,
+   and enables + starts `VarsanyB2Sync`.
 4. **Check on the new PC:**
    - `Get-Content C:\gimpTest\daemon.log -Tail 400 | Select-String -NotMatch 'Fonts +:' | Select-Object -Last 15`
      should show `Orders to process: N` and jobs being submitted (the very long `Fonts :` line is skipped).
