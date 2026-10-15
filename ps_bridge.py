@@ -108,7 +108,7 @@ def _clean_zone(zone_name, zone, canvas_w_px, canvas_h_px):
 
 def submit_job(order_id, template_path, zones, output_path, canvas_w_px=3780, canvas_h_px=3780, combined=True,
                job_type="standard", text_replacements=None, colour_hex=None, quantity=1, items=None,
-               multi_items=None):
+               multi_items=None, extra=None):
     """
     Write a job JSON for Photoshop UXP plugin to pick up.
     zones = {
@@ -155,6 +155,7 @@ def submit_job(order_id, template_path, zones, output_path, canvas_w_px=3780, ca
         "multi_items":       clean_multi_items,
         "submitted_at":      datetime.now().isoformat(),
     }
+    job.update(extra or {})     # job-specific settings for the plugin (e.g. hoodie crop / fit)
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     # Clear any stale done/error files from previous runs for this order

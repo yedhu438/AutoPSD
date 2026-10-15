@@ -249,11 +249,11 @@ def _build_psd_via_photoshop(order_id, row, out_path, force_bg_remove=False, qua
     if quantity > 1:
         log(f"  Quantity={quantity} — UXP will stack {quantity} copies vertically", "INFO")
 
-    # Socks: always print twice regardless of order quantity (one pair = two socks).
-    # Each sock canvas is 6×6cm; doubling produces two designs stacked on one DTF sheet.
-    if product == "socks":
+    # Pairs (socks, slippers): always print twice per ordered pair (one pair = two items).
+    # Each canvas is 6×6cm; doubling produces two designs stacked on one DTF sheet.
+    if product in PAIR_PRODUCTS:
         quantity = quantity * 2
-        log(f"  Socks pair: printing {quantity} copies (2 per ordered pair)", "INFO")
+        log(f"  {product.title()} pair: printing {quantity} copies (2 per ordered pair)", "INFO")
 
     # ── Split into multiple PSDs if the stacked canvas would exceed the ~30,000px
     # PSD format height ceiling — same fix and reasoning as _build_psd_multi_via_photoshop
@@ -403,6 +403,8 @@ def _build_psd_multi_via_photoshop(order_id, group_rows, out_path, force_bg_remo
 
         if zones:
             qty = max(1, int(row.get("Quantity") or 1))
+            if row_product in PAIR_PRODUCTS:
+                qty *= 2          # one ordered pair = two items to print (socks, slippers)
             for _ in range(qty):
                 multi_items.append({"zones": zones, "sku": row_sku})
             log(f"  Multi-item built: {row_sku} qty={qty} zones={list(zones.keys())}", "INFO")
@@ -948,7 +950,7 @@ PRODUCT_CANVAS = {
     "sleepsuit":      {"front": (cm_to_px(13), cm_to_px(18))},
     "hodieblanket":   {"front": (cm_to_px(17), cm_to_px(5))},
     # Home / Other
-    "cushion":        {"front": (cm_to_px(30), cm_to_px(30))},
+    "cushion":        {"front": (cm_to_px(30), cm_to_px(30))},   # pillow / cushion, every design (see detect_product)
     "memorialplaque": {"front": (cm_to_px(13), cm_to_px(8))},
     "golftowel":      {"front": (cm_to_px(17), cm_to_px(17))},
     "golfcase":       {"front": (cm_to_px(15), cm_to_px(6))},
@@ -956,6 +958,40 @@ PRODUCT_CANVAS = {
     # Default fallback
     "default":        {"front": (cm_to_px(30), cm_to_px(30)), "back": (cm_to_px(30), cm_to_px(30)), "pocket": (cm_to_px(9), cm_to_px(9))},
 }
+
+# Products sold as a PAIR: one ordered pair = two items to print, so each ordered unit is built twice
+# (stacked on one sheet, labelled #1 / #2). Socks always worked this way; slippers added 2026-10-14.
+PAIR_PRODUCTS = ("socks", "slipper")
+
+# ─── Football / gymnastic KIDS HOODIES: semi-custom, the customer enters only a NAME ──────────────────
+# Every design has a ready-made template PSD (23 x 30 cm) with one text layer holding a placeholder name,
+# in template\<folder>\<design>.psd - the design is the SKU before "_" (FballN01KidsHood_Blk78 ->
+# FballN01KidsHood.psd). Per the owner's Automation.xlsx the canvas is 23 x 30 cm (the template's own size, no crop),
+# the NAME is the SLEEVE print (18 x 5.5 cm box) and the graphic is the front print; the whole design must fit inside
+# the canvas below the usual top-left label. Football names are ALL CAPS, gymnastic names are "Capitalised" (first
+# letter up, the rest lower). Copies stack 1 cm apart, like pairs.
+HOODIE_DESIGNS = {}
+for _d in ("FballN01KidsHood", "FballN02KidsHood", "FballN03KidsHood", "FballN04KidsHood", "FballN05KidsHood",
+           "FballN06KidsHood", "NewFballN201KidsHood", "NewFballN202KidsHood"):
+    HOODIE_DESIGNS[_d] = ("Football Hoodie", "upper")
+for _i in range(1, 12):
+    HOODIE_DESIGNS[f"Gymnastichoodie{_i:02d}KidsHood"] = ("Gymnastic", "capitalize")
+HOODIE_OUT_W_PX           = cm_to_px(23)    # 2898 px: output width = the template's own width (no crop)
+HOODIE_NAME_FIT_W_PX      = cm_to_px(18)    # the name is shrunk to fit the sleeve box ...
+HOODIE_NAME_FIT_H_PX      = cm_to_px(5.5)   # ... 18 x 5.5 cm (never enlarged)
+HOODIE_MAX_COPIES_PER_PSD = 7               # 7 x 3780 px + gaps stays under the 30,000 px PSD height limit
+
+def get_hoodie_design(sku):
+    """Design key (e.g. 'FballN01KidsHood') when the SKU belongs to a hoodie template design, else None."""
+    d = (sku or "").split("_")[0]
+    return d if d in HOODIE_DESIGNS else None
+
+def format_hoodie_name(raw, rule):
+    """Tidy the customer's name: trim, collapse spaces, then ALL CAPS (football) or Capitalised (gymnastic)."""
+    name = " ".join((raw or "").split())
+    if rule == "upper":
+        return name.upper()
+    return name[:1].upper() + name[1:].lower()
 
 # Kids aged 1-4 get a smaller print area: 16 x 16 cm for front and back (owner request, 2026-10-14).
 # The age comes from the size in the SKU (KidsTee_Blk34 -> "3-4", Birthday1KidsTee_Wht12 -> "1-2").
@@ -1418,6 +1454,12 @@ def detect_product(sku):
     # Checked first so the generic "AnyTxt" catch-all (adult T-shirt) can never claim them.
     if "pebag" in sku.lower():
         return "pebag"
+    # Pillows / cushions: any design prefix (AnyTxtPilow_, PCushion05_, CustomCushion03_, MotherDPilowStyl2_, ...)
+    # is the cushion product, 30 x 30 cm (same as the generic text canvas). Checked before the SKU prefix table so
+    # the "AnyTxt" catch-all (adult T-shirt) cannot claim them. "Pilow" is the spelling the catalogue really uses.
+    _sl = sku.lower()
+    if "pilow" in _sl or "pillow" in _sl or "cushion" in _sl:
+        return "cushion"
     # Longest-prefix match — most specific entry wins over generic catch-alls like "AnyTxt"
     for prefix, product_key in sorted(SKU_MAP, key=lambda x: -len(x[0])):
         if sku.startswith(prefix):
@@ -3093,6 +3135,83 @@ def build_label_layer(label_text):
 
 # ─── SEMI-CUSTOM PSD BUILDER ──────────────────────────────────────────────────
 
+def _build_psd_hoodie(order_id, rows, out_path):
+    """
+    Football / gymnastic kids hoodies: open the design's template, put the customer's name in its text layer
+    (shrunk to fit the 18 x 5.5 cm sleeve box, centred), fit the whole design inside the 23 x 30 cm canvas below the
+    standard top-left label, save. Copies (quantity, or several rows) are stacked 1 cm apart, each with its own
+    label; more than 7 copies continue in OrderID_b.psd, _c ...
+    Returns (success: bool, message: str).
+    """
+    if not PS_BRIDGE_AVAILABLE:
+        return False, "ps_bridge.py not found — cannot process hoodie order"
+    if not _ps_alive():
+        return False, "Photoshop not running — cannot process hoodie order"
+    import json as _json
+
+    # names per design (keeps first-seen order), one entry per physical hoodie
+    groups = {}
+    for row in rows:
+        sku    = (row.get("SKU") or "").strip()
+        design = get_hoodie_design(sku)
+        if not design:
+            return False, f"No hoodie template for SKU: {sku}"
+        folder, rule = HOODIE_DESIGNS[design]
+        raw = (row.get("FrontText") or "").strip()
+        try:
+            _j = (row.get("FrontTextJSON") or "").strip()
+            if _j and _json.loads(_j).get("Text1"):
+                raw = str(_json.loads(_j)["Text1"])
+        except Exception:
+            pass
+        name = format_hoodie_name(raw, rule)
+        if not name:
+            log(f"  [hoodie] Skipping row — name is empty (SKU: {sku})", "WARN")
+            continue
+        copies = max(1, int(row.get("Quantity") or 1))
+        label  = make_zone_label("front", sku)          # same label as every other order, e.g. "Front - Red 11-13"
+        groups.setdefault(design, []).extend([(name, label)] * copies)
+        log(f"  [hoodie] {sku}: name={name!r} x{copies}  label={label!r}  ({rule})", "INFO")
+    if not groups:
+        return False, "No valid hoodie names — all rows had an empty name"
+
+    try:
+        from ps_bridge import submit_job, wait_for_completion
+    except Exception as e:
+        return False, f"ps_bridge import error: {e}"
+
+    base, ext = os.path.splitext(out_path)
+    n_files = total = 0
+    for design, names in groups.items():
+        folder, _rule = HOODIE_DESIGNS[design]
+        template_path = os.path.join(TEMPLATES_FOLDER, folder, design + ".psd")
+        if not os.path.isfile(template_path):
+            return False, f"Template file not found: {template_path}"
+        for start in range(0, len(names), HOODIE_MAX_COPIES_PER_PSD):
+            batch      = names[start:start + HOODIE_MAX_COPIES_PER_PSD]
+            suffix     = "" if n_files == 0 else f"_{chr(ord('a') + n_files)}"      # "", "_b", "_c" ...
+            batch_path = base + suffix + ext
+            n_files   += 1
+            total     += len(batch)
+            log(f"  [hoodie] {design}: {len(batch)} copy(ies) -> {os.path.basename(batch_path)}", "INFO")
+            submit_job(
+                order_id      = order_id,
+                template_path = template_path,
+                zones         = {},
+                output_path   = batch_path,
+                combined      = False,
+                job_type      = "semi_custom",
+                quantity      = len(batch),
+                canvas_h_px   = 3780,
+                items         = [{"name": n, "label": lbl} for n, lbl in batch],
+                extra         = {"hoodie": True, "crop_w_px": HOODIE_OUT_W_PX,
+                                 "fit_w_px": HOODIE_NAME_FIT_W_PX, "fit_h_px": HOODIE_NAME_FIT_H_PX},
+            )
+            if not wait_for_completion(order_id, timeout_sec=max(600, 150 * len(batch))):
+                return False, f"Photoshop job timed out or errored ({os.path.basename(batch_path)})"
+    return True, f"-> {os.path.basename(out_path)}  ({total} hoodie(s), {n_files} PSD(s))"
+
+
 def _build_psd_semi_custom(order_id, rows, out_path):
     """
     Process semi-customised rows (e.g. football jerseys with player name + number).
@@ -4035,10 +4154,27 @@ def run_batch(limit=None, order_id_filter=None, dry_run=False, sku_filter=None, 
             order_groups[oid] = []
         order_groups[oid].append(row)
 
-    total_orders = len(order_groups)
-    log(f"Unique orders: {total_orders}  (from {total} rows)")
+    # An order that mixes hoodie-template rows with other products (e.g. a kids tee + a football hoodie) is
+    # split in two: the hoodie rows go through the hoodie path, the rest through the normal path. Without this
+    # the whole order was routed by its FIRST row, so a hoodie row was built as a plain text zone (or the
+    # hoodie path rejected the order because of the non-hoodie row).
+    order_list = []
+    for _oid, _rows in order_groups.items():
+        _hood  = [r for r in _rows if get_hoodie_design((r.get("SKU") or "").strip())]
+        _other = [r for r in _rows if not get_hoodie_design((r.get("SKU") or "").strip())]
+        # An order with any embroidery / rhinestone row stays whole: it is skipped for manual handling as before,
+        # never half-built.
+        if _hood and _other and not any(is_emb_rhine_row(r) for r in _rows):
+            log(f"  {_oid}: mixed order - {len(_hood)} hoodie row(s) + {len(_other)} other row(s) built as two PSDs", "INFO")
+            order_list.append((_oid, _hood))
+            order_list.append((_oid, _other))
+        else:
+            order_list.append((_oid, _rows))
 
-    for i, (order_id, group_rows) in enumerate(order_groups.items(), 1):
+    total_orders = len(order_list)
+    log(f"Unique orders: {len(order_groups)}  (from {total} rows)")
+
+    for i, (order_id, group_rows) in enumerate(order_list, 1):
         first_row   = group_rows[0]
 
         # Date folder: use ConvertedShipByDate, fall back to today if missing
@@ -4182,7 +4318,8 @@ def run_batch(limit=None, order_id_filter=None, dry_run=False, sku_filter=None, 
         # Only treat as semi-custom if the SKU has a known jersey template.
         # Orders tagged SemiCustomized but with no template go through normal processing.
         _cat = (first_row.get("CustomizationCategory") or "").strip().lower()
-        is_semi_custom = _cat == "semicustomized" and get_semi_custom_template(sku_raw) is not None
+        _is_hoodie     = get_hoodie_design(sku_raw) is not None
+        is_semi_custom = _is_hoodie or (_cat == "semicustomized" and get_semi_custom_template(sku_raw) is not None)
 
         if is_semi_custom:
             # Override output path → Output\<date>\semicustomized\
@@ -4227,7 +4364,10 @@ def run_batch(limit=None, order_id_filter=None, dry_run=False, sku_filter=None, 
             if is_semi_custom:
                 # Pass ALL rows so multi-name orders (e.g. 4 football jerseys)
                 # are stacked onto one canvas instead of only processing row 1.
-                ok, msg = _build_psd_semi_custom(order_id, group_rows, out_path)
+                if _is_hoodie:
+                    ok, msg = _build_psd_hoodie(order_id, group_rows, out_path)
+                else:
+                    ok, msg = _build_psd_semi_custom(order_id, group_rows, out_path)
                 if not ok:
                     log(f"  Semi-custom FAILED: {msg}", "FAIL")
 

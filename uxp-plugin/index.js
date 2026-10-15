@@ -2,11 +2,17 @@ const {app,core,action,constants} = require("photoshop");
 const uxp = require("uxp");
 const fs  = uxp.storage.localFileSystem;
 
-const PLUGIN_VERSION = "v3.10b-fill-width";
+const PLUGIN_VERSION = "v3.13c-hoodie-groups";
 const POLL_MS   = 3000;
 const LABEL_PX  = 126;  // 1cm at 320dpi (halved from 2cm)
 const GAP_PX    = 126;  // 1cm gap between zones
 const CANVAS_W  = 3780; // default canvas width px
+
+// Label size and label-strip height scale with the zone width, so small zones (socks, slippers, pockets) are not
+// swamped by a label sized for a T-shirt: 12 pt and a 1 cm strip from 22 cm wide (2772 px) upwards,
+// proportionally smaller below that (never under 5 pt / 0.5 cm).
+function labelPt(zoneW){ return Math.max(5, Math.min(12, 12 * (zoneW||CANVAS_W) / 2772)); }
+function labelStrip(zoneW){ return Math.max(64, Math.min(LABEL_PX, Math.round(LABEL_PX * (zoneW||CANVAS_W) / 2772))); }
 
 let VARSANY_ROOT=null, DATA_FOLDER=null, JOBS_FOLDER=null, DONE_FOLDER=null, ERROR_FOLDER=null;
 let processing = false;
@@ -127,6 +133,14 @@ async function getImageEntry(imgPath){
 
 // ── batchPlay helpers ─────────────────────────────────────────────────────────
 async function bp(desc){return await action.batchPlay(desc,{synchronousExecution:true});}
+// Same as bp(), but a failed step stops the job (batchPlay itself only returns an error descriptor and carries on,
+// which let a failed paste go unnoticed and the following move/rename hit the wrong layer).
+async function bpc(desc, tag){
+  const r = await action.batchPlay(desc,{synchronousExecution:true});
+  const bad = (r||[]).find(x => x && (x._obj === "error" || (typeof x.message === "string" && x.message.length)));
+  if(bad){ trace("[bp-error] "+tag+": "+(bad.message || JSON.stringify(bad))); throw new Error(tag+": "+(bad.message || "batchPlay error")); }
+  return r;
+}
 
 // Move layer to Y offset using translate
 async function moveLayerToY(currentY, targetY){
@@ -191,13 +205,14 @@ function buildTextStyleRanges(text, normPS, normFamily, normStyle, colourProp, s
 }
 
 // Add black label text at given Y offset (top of label strip)
-async function addLabel(labelText, yTop, canvasW){
+async function addLabel(labelText, yTop, canvasW, zoneW){
+  const lblPt = labelPt(zoneW || canvasW), strip = labelStrip(zoneW || canvasW);
   await bp([{_obj:"make",_target:[{_ref:"textLayer"}],
     using:{_obj:"textLayer",textKey:labelText,
       textClickPoint:{_obj:"paint",horizontal:{_unit:"percentUnit",_value:1},vertical:{_unit:"percentUnit",_value:1}},
       textStyleRange:[{_obj:"textStyleRange",from:0,to:labelText.length,
         textStyle:{_obj:"textStyle",fontPostScriptName:"Arial-BoldMT",fontName:"Arial",fontStyleName:"Bold",
-          size:{_unit:"pointsUnit",_value:12},color:{_obj:"RGBColor",red:0,green:0,blue:0}}
+          size:{_unit:"pointsUnit",_value:lblPt},color:{_obj:"RGBColor",red:0,green:0,blue:0}}
       }]
     }
   }]);
@@ -205,9 +220,9 @@ async function addLabel(labelText, yTop, canvasW){
   // Align left then move to correct Y
   await bp([{_obj:"align",null:{_ref:[{_enum:"ordinal",_value:"targetEnum",_ref:"layer"}]},using:{_enum:"alignDistributeSelector",_value:"ADSLefts"},alignToCanvas:true}]);
   const lb = await getLayerBounds();
-  await moveLayerToY(lb.top, yTop + Math.round(LABEL_PX/2) - Math.round((lb.bottom-lb.top)/2));
+  await moveLayerToY(lb.top, yTop + Math.round(strip/2) - Math.round((lb.bottom-lb.top)/2));
   await bp([{_obj:"move",_target:[{_ref:"layer",_enum:"ordinal",_value:"targetEnum"}],
-    to:{_obj:"offset",horizontal:{_unit:"pixelsUnit",_value:GAP_PX},vertical:{_unit:"pixelsUnit",_value:0}}}]);
+    to:{_obj:"offset",horizontal:{_unit:"pixelsUnit",_value:Math.round(GAP_PX * lblPt / 12)},vertical:{_unit:"pixelsUnit",_value:0}}}]);
 }
 
 // ── Process one zone: place image + text at given Y offset ────────────────────
@@ -221,7 +236,7 @@ async function processZone(doc, zone, data, imgEntry, yOffset, zoneW, zoneH, res
   // content fills the height is exactly 2898x3780; short text gives a short block. Returns the bottom of the block.
   const MARGIN_PX = 38;    // side margin around the image
   const TEXT_GAP  = 63;    // gap between image and text (0.5cm)
-  const areaH     = Math.max(zoneH - LABEL_PX, 200);
+  const areaH     = Math.max(zoneH - labelStrip(zoneW), 200);
   const EDGE_PX   = 38;    // content stays this far from the top and bottom edge of the design area (0.3cm)
   const fitH      = Math.max(areaH - EDGE_PX*2, 100);   // height the image + text may actually use
   const areaTop   = yOffset + EDGE_PX;
@@ -368,6 +383,152 @@ async function processZone(doc, zone, data, imgEntry, yOffset, zoneW, zoneH, res
   return yOffset + usedH;
 }
 
+// ── Football / gymnastic hoodie templates: the single text layer holds the customer's NAME ───────────────
+// Writes the name into the template's only text layer (found by type - its layer name is just the old placeholder),
+// shrinks it to fit the sleeve box (never enlarges), centres it horizontally and keeps the placeholder's vertical
+// centre, puts ALL template layers into one layer GROUP (the name stays a live, editable text layer), fits that group
+// inside the canvas (below the label strip, inside the side margins - shrunk only if it does not already fit, never
+// enlarged) and adds the standard top-left label as a live text layer inside the same group.
+// cropW only matters when it differs from the template width (the owner's canvas is the template's own 23 x 30 cm).
+// groupName names the group. The group is left selected, so the caller can read its bounds or send it to another document.
+// Move the active layer by dx, dy pixels
+async function moveLayerBy(dx, dy){
+  if(Math.abs(dx) < 1 && Math.abs(dy) < 1) return;
+  await bp([{_obj:"move",_target:[{_ref:"layer",_enum:"ordinal",_value:"targetEnum"}],
+    to:{_obj:"offset",horizontal:{_unit:"pixelsUnit",_value:dx},vertical:{_unit:"pixelsUnit",_value:dy}}}]);
+}
+// VISIBLE extent of everything in a document: a layer group's own bounds also count pixels hanging off the canvas and
+// the clipped pattern layers, so the real extent is measured on a throw-away merged copy of the document.
+async function measureVisible(doc){
+  const tmp = await doc.duplicate("hoodie_measure");
+  let m = null;
+  try{
+    await selectDocById(tmp);
+    try{ await bpc([{_obj:"mergeVisible"}], "merge (measure)"); }
+    catch(e){ await bpc([{_obj:"mergeLayersNew"}], "merge group (measure)"); }
+    m = await getLayerBounds();
+  } finally {
+    try{ await tmp.close(constants.SaveOptions.DONOTSAVECHANGES); }catch(ce){ trace("measure copy close: "+ce.message); }
+    await selectDocById(doc);
+  }
+  return m;
+}
+// A layer group's bounds are NOT usable for placing it (Photoshop reports the whole canvas), so a hoodie group is located
+// by its NAME text layer, whose bounds are exact. Returns the group id and the top-left of the name text.
+function hoodieRef(d, groupName){
+  const g = d.layers.find(l => l.name === groupName);
+  if(!g) throw new Error("hoodie group '"+groupName+"' not found");
+  const t = g.layers.find(l => l.kind === "text" && !String(l.name).startsWith("Label_"));
+  if(!t) throw new Error("hoodie name text layer not found in '"+groupName+"'");
+  return {groupId: g.id, left: t.bounds.left, top: t.bounds.top};
+}
+async function closeQuietly(d){
+  if(!d) return;
+  try{ await d.close(constants.SaveOptions.DONOTSAVECHANGES); }catch(e){}
+}
+async function selectDocById(d){
+  await bpc([{_obj:"select",_target:[{_ref:"document",_id:d.id}],_options:{dialogOptions:"dontDisplay"}}], "select document "+d.id);
+}
+function dbg(tag){
+  try{ const d = app.activeDocument; trace("[doc] "+tag+": open="+app.documents.length+" active='"+d.name+"' id="+d.id+" "+d.width+"x"+d.height); }
+  catch(e){ trace("[doc] "+tag+": "+e.message); }
+}
+async function applyHoodieName(name, fitW, fitH, cropW, docRef, label, groupName){
+  const doc = docRef || app.activeDocument;
+  await selectDocById(doc);
+  let tl = null;
+  for(const l of doc.layers){ if(l.kind === "text"){ tl = l; break; } }
+  if(!tl) throw new Error("Hoodie template has no text layer");
+  const id = tl.id;
+  await bp([{_obj:"select",_target:[{_ref:"layer",_id:id}],makeVisible:false}]);
+  const before = await getLayerBounds();                      // the placeholder name: remember its vertical centre
+  // Replace the text through the DOM (textItem.contents): it keeps the layer's character style AND its transform.
+  // The batchPlay "set textKey" used first re-stored the layer as a small base size and lost the template's scale,
+  // so every name came out about a third of the template size.
+  let szBefore = null, szAfter = null, viaDom = true;
+  try{ szBefore = tl.textItem.characterStyle.size; }catch(e){}
+  try{ tl.textItem.contents = name; }
+  catch(e){
+    viaDom = false; trace("DOM contents failed ("+e.message+") - using batchPlay");
+    await bp([{_obj:"set",_target:[{_ref:"layer",_id:id}],to:{_obj:"textLayer",textKey:name}}]);
+  }
+  // Replacing the text drops the template's scale factor (Photoshop then reports the small base size: 203 -> 52).
+  // Measure that drop and scale the layer back up by exactly the same factor, so the new name keeps the template size.
+  let restoreScale = 1;
+  try{
+    szAfter = tl.textItem.characterStyle.size;
+    if(szBefore && szAfter && szAfter < szBefore * 0.9) restoreScale = szBefore / szAfter;
+  }catch(e){}
+  trace("text set via "+(viaDom?"DOM":"batchPlay")+"; font size before "+szBefore+", after "+szAfter+", restore x"+restoreScale.toFixed(2));
+  await bp([{_obj:"select",_target:[{_ref:"layer",_id:id}],makeVisible:false}]);
+  let b = await getLayerBounds();
+  if(restoreScale > 1.1){
+    await bp([{_obj:"transform",null:{_ref:[{_ref:"layer",_enum:"ordinal",_value:"targetEnum"}]},
+      freeTransformCenterState:{_enum:"quadCenterState",_value:"QCSAverage"},
+      width:{_unit:"percentUnit",_value:restoreScale*100},height:{_unit:"percentUnit",_value:restoreScale*100},
+      constrainProportions:true,interfaceIconFrameDimmed:{_enum:"interpolationType",_value:"bicubicAutomatic"}}]);
+    const rb = await getLayerBounds();
+    trace("size restored: "+Math.round(b.w)+"x"+Math.round(b.h)+" -> "+Math.round(rb.w)+"x"+Math.round(rb.h));
+    b = rb;
+  }
+  const scale = Math.min(1, fitW/(b.w||1), fitH/(b.h||1));
+  if(scale < 0.995){
+    await bp([{_obj:"transform",null:{_ref:[{_ref:"layer",_enum:"ordinal",_value:"targetEnum"}]},
+      freeTransformCenterState:{_enum:"quadCenterState",_value:"QCSAverage"},
+      width:{_unit:"percentUnit",_value:scale*100},height:{_unit:"percentUnit",_value:scale*100},
+      constrainProportions:true,interfaceIconFrameDimmed:{_enum:"interpolationType",_value:"bicubicAutomatic"}}]);
+    b = await getLayerBounds();
+  }
+  const {w:docW, h:docH} = await getDocSize();
+  await moveLayerByX(Math.round(docW/2 - (b.left + b.right)/2));
+  await moveLayerToY(b.top, Math.round((before.top + before.bottom)/2 - b.h/2));
+  trace("hoodie name '"+name+"': "+Math.round(b.w)+"x"+Math.round(b.h)+"px, scale "+Math.round(scale*100)+"%, placeholder was "+Math.round(before.w)+"x"+Math.round(before.h));
+  if(cropW && cropW !== docW) await doc.resizeCanvas(cropW, docH, constants.AnchorPosition.MIDDLECENTER);
+  const {w:cW, h:cH} = await getDocSize();
+
+  // ONE GROUP for the whole design: every template layer (graphic, clipped pattern layers, the name TEXT layer) goes
+  // into a layer group, exactly like Ctrl+G, so the name stays a live editable text layer and the clip chains stay
+  // intact. The group is then fitted and moved as a unit.
+  await bpc([{_obj:"selectAllLayers",_target:[{_ref:"layer",_enum:"ordinal",_value:"targetEnum"}]}], "select all layers");
+  await bpc([{_obj:"make",_target:[{_ref:"layerSection"}],from:{_ref:"layer",_enum:"ordinal",_value:"targetEnum"}}], "group layers");
+  await bp([{_obj:"set",null:{_ref:[{_enum:"ordinal",_value:"targetEnum",_ref:"layer"}]},to:{_obj:"layer",name:groupName || ("Hoodie_"+name)}}]);
+  const gr = await bpc([{_obj:"get",_target:[{_ref:"layer",_enum:"ordinal",_value:"targetEnum"}]}], "group id");
+  const gid = gr[0].layerID;
+  const selectGroup = async () => { await bp([{_obj:"select",_target:[{_ref:"layer",_id:gid}],makeVisible:false}]); };
+
+  // FIT TO THE CANVAS: the design must lie inside the side margins and below the label strip. Shrink it only when it
+  // does not already fit (never enlarged), then shift it into the free area.
+  let d = await measureVisible(doc);
+  await selectGroup();
+  const MARGIN_PX = 38, EDGE_PX = 38, strip = labelStrip(cW);
+  const aL = MARGIN_PX, aR = cW - MARGIN_PX, aT = (label ? strip : 0) + EDGE_PX, aB = cH - EDGE_PX;
+  const fitScale = Math.min(1, (aR - aL)/(d.w||1), (aB - aT)/(d.h||1));
+  if(fitScale < 0.995){
+    await bp([{_obj:"transform",null:{_ref:[{_ref:"layer",_enum:"ordinal",_value:"targetEnum"}]},
+      freeTransformCenterState:{_enum:"quadCenterState",_value:"QCSAverage"},
+      width:{_unit:"percentUnit",_value:fitScale*100},height:{_unit:"percentUnit",_value:fitScale*100},
+      constrainProportions:true,interfaceIconFrameDimmed:{_enum:"interpolationType",_value:"bicubicAutomatic"}}]);
+    d = await measureVisible(doc);
+    await selectGroup();
+  }
+  let dx = 0, dy = 0;
+  if(d.left < aL) dx = aL - d.left; else if(d.right > aR) dx = aR - d.right;
+  if(d.top < aT) dy = aT - d.top; else if(d.bottom > aB) dy = aB - d.bottom;
+  await moveLayerBy(Math.round(dx), Math.round(dy));
+  trace("hoodie design fit: "+Math.round(d.w)+"x"+Math.round(d.h)+" at ("+Math.round(d.left)+","+Math.round(d.top)+") canvas "+cW+"x"+cH+", scale "+Math.round(fitScale*100)+"%, shift "+Math.round(dx)+","+Math.round(dy));
+
+  // The label goes INSIDE the group (a new layer is created above the selected layer, in the same container), so each
+  // stacked copy carries its own label and moves as one unit.
+  if(label){
+    const grp = doc.layers.find(l => l.id === gid);
+    const kid = grp && grp.layers && grp.layers.length ? grp.layers[0] : null;
+    if(kid) await bp([{_obj:"select",_target:[{_ref:"layer",_id:kid.id}],makeVisible:false}]);
+    await addLabel(label, 0, cW, cW);
+  }
+  await selectGroup();
+  return {w:b.w, h:b.h, scale:scale};
+}
+
 // ── Main job processor ────────────────────────────────────────────────────────
 async function processJob(jobEntry){
   let job, orderId=jobEntry.name.replace(".json","");
@@ -451,7 +612,69 @@ async function processJob(jobEntry){
           }
         }
 
-        if(items.length === 1){
+        if(job.hoodie){
+          // ── Football / gymnastic hoodie: write each name into the template, stack copies 1 cm apart ──────
+          const fitW = job.fit_w_px || 2268, fitH = job.fit_h_px || 693, cropW = job.crop_w_px || 2520;
+          const HGAP = 126;
+          dbg("hoodie start");
+          // Re-opening the template file does not give a second, independent copy (the edits of copy 2 landed in
+          // the first document). So: make one pristine spare with duplicate() now, before the main document is
+          // changed, and make every further copy from it. Documents are always picked by id, never "the active one".
+          let spare = null;
+          if(items.length > 1){
+            spare = await doc.duplicate("hoodie_spare");
+            await selectDocById(doc);
+          }
+          let copyDoc = null;
+          try{
+          await applyHoodieName(items[0].name, fitW, fitH, cropW, doc, items[0].label,
+            items.length > 1 ? "Hoodie_1_"+items[0].name : "Hoodie_"+items[0].name);
+          const {w:tplW, h:tplH} = await getDocSize();               // cropW x 3780 after the crop
+          log("Hoodie 1/"+items.length+": "+items[0].name);
+          dbg("hoodie 1 done");
+          if(items.length > 1){
+            // Copy 1 is one layer GROUP (design + live name + label), exactly like every further copy.
+            await doc.resizeCanvas(tplW, tplH*items.length + HGAP*(items.length-1), constants.AnchorPosition.TOPLEFT);
+            for(let k = 1; k < items.length; k++){
+              const copy = await spare.duplicate("hoodie_copy_"+(k+1));
+              copyDoc = copy;
+              await selectDocById(copy);
+              dbg("copy "+(k+1)+" made");
+              await applyHoodieName(items[k].name, fitW, fitH, cropW, copy, items[k].label, "Hoodie_"+(k+1)+"_"+items[k].name);
+              // No clipboard: the copy is one layer GROUP (design + live name + label, left selected); send that group to
+              // the main document and place it by its own bounds: same x, y shifted by this copy's slot offset.
+              const gName = "Hoodie_"+(k+1)+"_"+items[k].name;
+              const ref0  = hoodieRef(copy, gName);                    // name text position inside the copy (exact)
+              await bpc([{_obj:"duplicate",_target:[{_ref:"layer",_enum:"ordinal",_value:"targetEnum"}],
+                to:{_ref:"document",_id:doc.id},version:5}], "send group to main document");
+              await copy.close(constants.SaveOptions.DONOTSAVECHANGES);
+              copyDoc = null;
+              await purgeCaches();
+              await selectDocById(doc);
+              const ref1  = hoodieRef(doc, gName);                     // where the sent group's name text landed
+              const slotY = k * (tplH + HGAP);
+              const mdx = Math.round(ref0.left - ref1.left), mdy = Math.round(ref0.top + slotY - ref1.top);
+              await bp([{_obj:"select",_target:[{_ref:"layer",_id:ref1.groupId}],makeVisible:false}]);
+              await moveLayerBy(mdx, mdy);
+              trace("hoodie "+(k+1)+": sent group landed at ("+Math.round(ref1.left)+","+Math.round(ref1.top)+"), moved by "+mdx+","+mdy+" (slot offset "+slotY+")");
+              log("Hoodie "+(k+1)+"/"+items.length+": "+items[k].name);
+            }
+            try{ await spare.close(constants.SaveOptions.DONOTSAVECHANGES); }catch(se){ log("Spare close warning: "+se.message, true); }
+            await selectDocById(doc);
+            dbg("before save");
+          }
+          }catch(he){ await closeQuietly(copyDoc); await closeQuietly(spare); throw he; }
+          const outToken = fs.createSessionToken(outEntry);
+          log("Saving hoodie: "+outEntry.nativePath);
+          await bp([{_obj:"save",null:{_ref:[{_enum:"ordinal",_value:"targetEnum",_ref:"document"}]},
+            in:{_path:outToken,_kind:"local"},as:{_obj:"photoshop35Format",embedProfiles:true}}]);
+          log("Saved: "+outEntry.name);
+          success=true;
+          try{ await doc.close(constants.SaveOptions.DONOTSAVECHANGES); }catch(ce){ log("Close warning (non-fatal): "+ce.message, true); }
+          doc=null;
+          await purgeCaches();
+
+        } else if(items.length === 1){
           // ── Single item / multi-slot template ────────────────────────────────────
           // For multi-slot orders, text_replacements contains ALL slots at once
           // e.g. {"Player":"Scott","08":"3","Player copy":"Karis","08 copy":"9",...}
@@ -587,7 +810,7 @@ async function processJob(jobEntry){
       // ── STANDARD: zone processing ─────────────────────────────────────────────
 
       const quantity    = (job.quantity && job.quantity > 1) ? Math.round(job.quantity) : 1;
-      const QTY_GAP_PX  = 126;  // 1cm gap between copies at 320dpi (for cutting)
+      const QTY_GAP_PX  = 0;    // extra gap between copies: none - the GAP_PX after each block is already the 1cm cutting gap
       const ZONE_ORDER  = ["pocket","front","back","sleeve"];
 
       // ── MULTI-ITEM MODE: different design per item, all stacked on one canvas ──
@@ -622,10 +845,10 @@ async function processJob(jobEntry){
           for(const [zone,data] of sortedZ){
             const isPocket   = zone.startsWith("pocket");
             const labelText  = (data.label||zone.toUpperCase()).toUpperCase();
-            await addLabel(labelText, currentY, itemMaxW);
-            currentY += LABEL_PX;
             const zoneW = data.zone_w_px||docW;
             const zoneH = data.zone_h_px||docW;
+            await addLabel(labelText, currentY, itemMaxW, zoneW);
+            currentY += labelStrip(zoneW);
             // Use zone+itemIdx as unique key so layer names never collide
             const zoneKey = zone+"_"+itemIdx;
             const zoneBottom = await processZone(doc, zoneKey, data, itemImgs[zone]||null, currentY, zoneW, zoneH, res, isPocket, itemIdx);
@@ -682,12 +905,12 @@ async function processJob(jobEntry){
             // Add label — append copy number when quantity > 1 so layers are identifiable
             const baseLabel = (data.label || zone.toUpperCase()).toUpperCase();
             const labelText = quantity > 1 ? baseLabel+" #"+(copyIdx+1) : baseLabel;
-            await addLabel(labelText, currentY, docW);
-            currentY += LABEL_PX;
-
-            // Place image + text for this zone
             const zoneW = data.zone_w_px || docW;
             const zoneH = data.zone_h_px || docW;
+            await addLabel(labelText, currentY, docW, zoneW);
+            currentY += labelStrip(zoneW);
+
+            // Place image + text for this zone
             const zoneBottom = await processZone(doc, zone, data, imgEntries[zone], currentY, zoneW, zoneH, res, isPocket, copyIdx);
             currentY = zoneBottom + GAP_PX;
 

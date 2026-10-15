@@ -1,7 +1,7 @@
 # Varsany Print Automation — Project Knowledge Base
 
 > Business: Varsany / Fullymerched — Amazon custom print-on-demand
-> Last updated: 2026-10-14 (layout rework + kids 1-4 canvas — see section 22; earlier changes in section 21)
+> Last updated: 2026-10-15 (hoodies, cushions, pairs — see section 23; layout rework in section 22; earlier changes in section 21)
 
 ---
 
@@ -193,6 +193,16 @@ before the SKU prefix table so the generic `AnyTxt` catch-all (adult T-shirt, 30
 claim them. Before this only `FBall01PEBag_` had the size; `AnyTxtPEBag_` (1,339 rows a year) came out
 30 × 30 cm. Embroidery PE bags (`PEBag_…EMB`) get it too but are skipped by the pipeline anyway.
 
+### Cushions / pillows: 30 × 30 cm (owner request, 2026-10-15)
+Any SKU containing `pilow`, `pillow` or `cushion` maps to the `cushion` product (30 × 30 cm = 3780 × 3780 px,
+text layout like any other text canvas). The check runs early in `detect_product()`, before the SKU prefix table,
+so the generic `AnyTxt` catch-all can no longer claim them.
+
+### Pairs: socks and slippers always print twice
+`PAIR_PRODUCTS = ("socks", "slipper")` in `batch_processor.py`: for these products the number of copies is
+**doubled** (one ordered pair = two items to print), in the single-item and the multi-item builders alike.
+Quantity 1 → 2 copies, quantity 2 → 4 copies.
+
 ### Kids aged 1-4: 16 × 16 cm (owner request, 2026-10-14)
 For kids aged 1-4 the **front and back** canvas is **16 × 16 cm = 2016 × 2016 px**
 instead of the product's normal size. `get_product_canvas(sku, product)` in
@@ -349,6 +359,56 @@ placeholders) that can't be generated from a blank canvas.
 ⚠️ **Only `england Football Adult.psd` currently exists in `C:\gimpTest\template\`.**
 The other 3 configured templates are missing on this machine — any
 Scotland or Kids jersey order will fail until those files are restored.
+
+### Football / gymnastic kids hoodies (`HOODIE_DESIGNS`, plugin ≥ v3.13c, owner request 2026-10-15)
+Templates live in `template\Football Hoodie\` (`FballN01…06KidsHood`, `NewFballN201/202KidsHood`) and
+`template\Gymnastic\` (`Gymnastichoodie01…11KidsHood`) — one PSD per design, 2898 × 3780 px, one graphic plus
+**one text layer holding a placeholder name**. The design is the SKU prefix before the first `_`. `Birthday Top`
+is not automated yet.
+
+- **What the customer's text is:** the *name printed on the sleeve* (`FrontTextJSON` `Text1`, else `FrontText`).
+  The graphic is the front print; the name is placed under it in the same file. Source of truth for sizes: the
+  owner's `Automation.xlsx` (canvas 23 × 30 cm, sleeve 18 × 5.50 cm; `FCustom` designs have a 9 × 25 cm sleeve).
+- **Case:** football designs → ALL CAPS; gymnastic designs → first letter capital, rest lowercase
+  (`format_hoodie_name`).
+- **Size:** the name keeps the template's own size, but is shrunk (never enlarged) to fit the sleeve box
+  **18 × 5.5 cm** (`HOODIE_NAME_FIT_W_PX/H_PX`), centred horizontally on the canvas, vertical centre kept.
+- **Canvas:** **23 × 30 cm** (2898 × 3780 px) = the template's own size, **no crop** (`HOODIE_OUT_W_PX`). (An
+  earlier version cropped to 20 cm from a chat answer; the Excel says 23 × 30 and overrides it.)
+- **Everything stays editable (owner request):** all template layers go into ONE layer **group** per hoodie —
+  the name is a **live text layer** (pattern layers still clipped to it) and the label a live text layer inside
+  the same group. Nothing is merged or rasterised in the output file.
+- **Fit + label:** the group must lie inside the canvas margins (38 px)
+  and below the standard label strip — it is shrunk only if it does not already fit (never enlarged) and shifted
+  into the free area (in practice the template art already fits; a few templates move down ≤ 72 px). Every
+  hoodie gets the **standard top-left label** (`make_zone_label("front", sku)`, e.g. `Front - Red - 11-13`).
+- **Quantity / several rows:** copies of the same design are stacked vertically with a 1 cm (126 px) gap, up to
+  7 per PSD (`HOODIE_MAX_COPIES_PER_PSD`); more continue in `OrderID_b.psd`; a different design = its own file.
+  A stacked file is 2898 × (3780 × n + 126 × (n-1)) px; each copy is one group `Hoodie_<n>_<name>` (design layers +
+  live name + live `Label_…`). A single-hoodie file has one group `Hoodie_<name>`.
+- **Mixed orders** (hoodie rows + other products, e.g. a kids tee): split in the main loop into a hoodie PSD
+  (→ `semicustomized\`) and a normal PSD for the other rows. **Exception:** an order with any embroidery /
+  rhinestone row is not split — it is skipped whole for manual handling, as before.
+- Output goes to `Output\<ship-by-date>\semicustomized\`.
+- **Plugin implementation notes (why the code looks the way it does):**
+  - Replacing the text of a template layer makes Photoshop drop the layer's scale factor (size 203 → 52 base).
+    `applyHoodieName` measures the drop and scales the layer back by the same factor, then fits it.
+  - Re-opening the same template file does **not** give an independent second document — copies are made with
+    `duplicate()` from a pristine spare, and documents are always selected **by id**.
+  - `bp()` does not report batchPlay errors; use `bpc()` where a silent failure would produce a wrong PSD
+    (a failed paste once made the next move/rename hit the wrong layer).
+  - The clipboard is not used; a copy's group is sent to the main document with `duplicate … to document` and
+    placed by the **name text layer's** bounds (`hoodieRef`) — a layer group's own bounds are NOT usable
+    (Photoshop reports the whole canvas for them).
+  - The visible extent of a design (needed for the fit) is measured on a throw-away merged copy of the
+    document (`measureVisible`), because the group's bounds also count pixels hanging off the canvas.
+  - The templates' pattern layers are clipped onto the name: they must stay in one group with it, and nothing may
+    be inserted into that chain (an earlier version inserted a layer there and the clipped gradient leaked out as a
+    rectangle). Merging was the earlier workaround; the group approach replaced it so the text stays editable.
+  - If a stacked job fails, the copy / spare documents are closed again (`closeQuietly`).
+- **Known gaps:** kids sweatshirt designs (`FballN0xKidsSwetShirt`) and `FCustom` hoodies (9 × 25 cm sleeve)
+  have no templates; the Liverpool semi-custom kids tee (`Lvrpool201KidsTee`, print location "CHAMPIONS 20")
+  has no text/image data and no template, so it fails with "No zones".
 
 The `template\` folder also still contains ~25 other `{product}.psd` /
 `{product}_combined.psd` files (adulttshirt.psd, babyvest.psd, etc.) —
@@ -751,3 +811,14 @@ Done while moving production to a new PC (nothing here changes the database sche
   Windows' view — hardware to be checked before it becomes the production machine;
   (4) football kids hoodies (`FballN…KidsHood`) map to the adult hoodie canvas (25 × 25 cm) — open question;
   (5) sizes shown as "E23" in labels, and football-shorts "12" shown as "1-2", are parser quirks.
+
+## 23. Changelog (2026-10-15 — hoodies, cushions, pairs)
+
+- **Football / gymnastic hoodie templates automated** (section 8): name replaced in the template text layer,
+  case rule per design family, name fitted to 18 × 5.5 cm, 23 × 30 cm canvas (per the owner's Excel) with the
+  design fitted inside it and the standard label, copies stacked with a 1 cm gap, mixed orders split. **All text
+  stays editable** (one layer group per hoodie, live name + live label). Plugin v3.13c.
+- **Cushions / pillows → 30 × 30 cm**; **socks and slippers always print two copies** (section 4).
+- **Pair rule, label and gap:** label scales with the zone width, the copy gap is the single 1 cm cutting gap
+  (plugin v3.11).
+- Test export switches unchanged: `--reprocess --no-mark --order … --output …`.
