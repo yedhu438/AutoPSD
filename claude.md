@@ -1,7 +1,7 @@
 # Varsany Print Automation — Project Knowledge Base
 
 > Business: Varsany / Fullymerched — Amazon custom print-on-demand
-> Last updated: 2026-10-15 (hoodies, cushions, pairs — see section 23; layout rework in section 22; earlier changes in section 21)
+> Last updated: 2026-10-15 (hoodies, birthday tops, cushions, pairs — see section 23; layout rework in section 22; earlier changes in section 21)
 
 ---
 
@@ -409,6 +409,39 @@ is not automated yet.
 - **Known gaps:** kids sweatshirt designs (`FballN0xKidsSwetShirt`) and `FCustom` hoodies (9 × 25 cm sleeve)
   have no templates; the Liverpool semi-custom kids tee (`Lvrpool201KidsTee`, print location "CHAMPIONS 20")
   has no text/image data and no template, so it fails with "No zones".
+
+### Birthday Top kids tees (`BIRTHDAY_DESIGNS`, plugin ≥ v3.14c, owner request 2026-10-15)
+Templates in `template\Birthday Top\`: `Birthday01KidsTee.psd` (boy, 2898 × 7285 px) and `Birthday2KidsTee.psd`
+(girl, 2898 × 5651 px). Each file holds **two zones stacked in one tall file**: `front` (fixed artwork, one pixel
+layer) and `back` (the customer's **name** + **age number**, font MagicalSnow, one colour per letter), each with a
+big grey template label (`front` / `back`) that the automation replaces.
+
+- **Which design:** SKU prefix — `Birthday01KidsTee` and `Birthday1KidsTee` = **boy** (template `Birthday01KidsTee`),
+  `Birthday02KidsTee` and `Birthday2KidsTee` = **girl** (template `Birthday2KidsTee`). The `1` / `2` spellings are the
+  ages 1-2 / 3-4 variants. (The DB names confirm it: 02 rows are girls' names.)
+- **Customer data:** `FrontTextJSON` `{"Text1":"<name>","Text2":"<number>"}`, print location `Name:`, no image.
+- **Name:** printed in CAPITALS. **Number:** leading zeros dropped (`06` → `6`).
+- **Colours (owner's lists)** — name letters take the next colour in order, repeating from 1 after the 6th
+  letter; **spaces do not use up a colour**; the number has its own single colour:
+  - boy: `266a90 db322f d8792a 292557 266a90 db322f`, number `292557`
+  - girl: `664c9f e18e29 df2d3a d92884 00a575 d94e86`, number `d74f85`
+- **Size:** the name and number keep the template's own size (shrunk only if wider than the zone, with 38 px
+  margins); centred horizontally, the template's vertical position kept.
+- **Canvas per zone (owner's Excel):** ages 5+ → 23 × 30 cm: the **template's own layout and size are kept**
+  (the file stays 2898 px wide). Ages **1-2 and 3-4 → 16 × 16 cm** per zone: each zone is scaled to fit its
+  16 × 16 cm block below the label strip and the file is cut to 2016 px wide (`birthday_zone_px`).
+- **Labels:** the template's `front` / `back` labels are removed and the standard small labels added:
+  `Front - White - 5-6` / `Back - White - 5-6` (`make_zone_label`).
+- **Editable:** one layer group per tee (`Birthday_<n>_<name>`) with live name / number / label text layers.
+- **Copies / several rows:** stacked 1 cm apart in the same way as the hoodies; rows with a different design or
+  zone size go to their own file (`OrderID_b.psd` ...); at most ~3 tall tees (28,000 px limit) per file.
+- **Mixed orders:** `batch_processor` splits an order into one entry per kind (hoodie / birthday / other); an
+  order with any embroidery / rhinestone row is still skipped whole.
+- **Plugin notes:** a Photoshop style range REPLACES the whole style — every per-letter range must carry the
+  font (`MagicalSnow`) and size again (`replaceTemplateText`), otherwise Photoshop falls back to Myriad Pro at a
+  tiny size; **every character needs a range, spaces included**, or the space collapses. Replacing the text also
+  drops the layer's scale factor, which is restored from the glyph size / height.
+- Output goes to `Output\<ship-by-date>\semicustomized\`.
 
 The `template\` folder also still contains ~25 other `{product}.psd` /
 `{product}_combined.psd` files (adulttshirt.psd, babyvest.psd, etc.) —
@@ -821,4 +854,7 @@ Done while moving production to a new PC (nothing here changes the database sche
 - **Cushions / pillows → 30 × 30 cm**; **socks and slippers always print two copies** (section 4).
 - **Pair rule, label and gap:** label scales with the zone width, the copy gap is the single 1 cm cutting gap
   (plugin v3.11).
+- **Birthday Top kids tees automated** (section 8): boy / girl template by SKU, name in capitals with one colour per
+  letter (owner's lists), age number in its own colour, standard labels, 23 × 30 cm per zone (16 × 16 cm for
+  ages 1-4), all text live. Plugin v3.14c. Mixed-order splitting now works per kind (hoodie / birthday / other).
 - Test export switches unchanged: `--reprocess --no-mark --order … --output …`.

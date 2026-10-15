@@ -986,6 +986,59 @@ def get_hoodie_design(sku):
     d = (sku or "").split("_")[0]
     return d if d in HOODIE_DESIGNS else None
 
+# ─── BIRTHDAY TOP kids tees: semi-custom, the customer enters a NAME and a NUMBER (the age) ──────────────────
+# template\Birthday Top\<file>.psd holds two zones in one tall file: "front" (fixed artwork) and "back" (the name +
+# the age number in MagicalSnow, ONE COLOUR PER LETTER). Design 01 / 1 = BOY, 02 / 2 = GIRL (the names in the DB
+# confirm it: Birthday02 rows are Alice, Rosie, Jessica ...; Birthday01 rows are Zachary, Hassan ...). Per the owner's
+# Automation.xlsx each zone is 23 x 30 cm, but 16 x 16 cm for ages 1-2 and 3-4 (the same kids 1-4 rule as other tees).
+# Letter colours repeat from the first colour after the 6th letter (spaces do not use up a colour).
+BIRTHDAY_SUBFOLDER = "Birthday Top"
+BIRTHDAY_DESIGNS = {
+    "Birthday01KidsTee": ("Birthday01KidsTee.psd", "boy"),
+    "Birthday1KidsTee":  ("Birthday01KidsTee.psd", "boy"),
+    "Birthday02KidsTee": ("Birthday2KidsTee.psd",  "girl"),
+    "Birthday2KidsTee":  ("Birthday2KidsTee.psd",  "girl"),
+}
+BIRTHDAY_COLOURS = {                       # gender -> (six letter colours in order, number colour)
+    "boy":  (["266a90", "db322f", "d8792a", "292557", "266a90", "db322f"], "292557"),
+    "girl": (["664c9f", "e18e29", "df2d3a", "d92884", "00a575", "d94e86"], "d74f85"),
+}
+BIRTHDAY_TEMPLATE_H_PX   = {"Birthday01KidsTee.psd": 7285, "Birthday2KidsTee.psd": 5651}   # one copy's height
+BIRTHDAY_SMALL_COPY_H_PX = 4400            # one copy of ages 1-4 (two 16 x 16 cm zones + labels + gap), estimate
+BIRTHDAY_PSD_MAX_H_PX    = 28000           # stay clear of the 30,000 px PSD height limit
+
+def get_birthday_design(sku):
+    """Design key (e.g. 'Birthday02KidsTee') when the SKU is a Birthday Top design, else None."""
+    d = (sku or "").split("_")[0]
+    return d if d in BIRTHDAY_DESIGNS else None
+
+def format_birthday_name(raw):
+    """Names are printed in capitals (the girl template has the All Caps attribute, the boy sample is typed in caps)."""
+    return " ".join((raw or "").split()).upper()
+
+def format_birthday_number(raw):
+    """The age number: '06' -> '6' (leading zeros dropped); anything that is not a plain number is kept as typed."""
+    s = (raw or "").strip()
+    return str(int(s)) if s.isdigit() else s
+
+def birthday_zone_px(sku):
+    """(zone width, zone height) in px: 23 x 30 cm, or 16 x 16 cm for ages 1-2 and 3-4."""
+    age = kids_upper_age(sku)
+    if age is not None and age <= SMALL_KIDS_MAX_AGE:
+        side = cm_to_px(SMALL_KIDS_CM)
+        return side, side
+    return cm_to_px(23), cm_to_px(30)
+
+def birthday_letter_colours(name, palette):
+    """One hex colour per character of the name (None for spaces); the palette repeats after its last colour."""
+    out, i = [], 0
+    for ch in name:
+        if ch.isspace():
+            out.append(None)
+        else:
+            out.append(palette[i % len(palette)]); i += 1
+    return out
+
 def format_hoodie_name(raw, rule):
     """Tidy the customer's name: trim, collapse spaces, then ALL CAPS (football) or Capitalised (gymnastic)."""
     name = " ".join((raw or "").split())
@@ -3212,6 +3265,86 @@ def _build_psd_hoodie(order_id, rows, out_path):
     return True, f"-> {os.path.basename(out_path)}  ({total} hoodie(s), {n_files} PSD(s))"
 
 
+def _build_psd_birthday(order_id, rows, out_path):
+    """
+    Birthday Top kids tees: open the design's template (front artwork + back name/number), put the customer's NAME
+    (capitals, one colour per letter) and AGE number (one colour) into its text layers, swap the template's labels for
+    the standard ones, and for ages 1-4 fit each zone into 16 x 16 cm. Copies (several rows) are stacked 1 cm apart;
+    rows with a different design or zone size go to their own file (OrderID_b.psd, _c ...).
+    Returns (success: bool, message: str).
+    """
+    if not PS_BRIDGE_AVAILABLE:
+        return False, "ps_bridge.py not found — cannot process birthday order"
+    if not _ps_alive():
+        return False, "Photoshop not running — cannot process birthday order"
+    import json as _json
+
+    groups = {}                                   # (template file, zone w, zone h) -> list of copies, first-seen order
+    for row in rows:
+        sku    = (row.get("SKU") or "").strip()
+        design = get_birthday_design(sku)
+        if not design:
+            return False, f"No birthday template for SKU: {sku}"
+        tpl_file, gender = BIRTHDAY_DESIGNS[design]
+        palette, num_colour = BIRTHDAY_COLOURS[gender]
+        raw_name, raw_num = (row.get("FrontText") or "").strip(), ""
+        try:
+            _j = _json.loads((row.get("FrontTextJSON") or "").strip() or "{}")
+            raw_name = str(_j.get("Text1") or raw_name)
+            raw_num  = str(_j.get("Text2") or "")
+        except Exception:
+            pass
+        name, number = format_birthday_name(raw_name), format_birthday_number(raw_num)
+        if not name or not number:
+            log(f"  [birthday] Skipping row — name or age number is empty (SKU: {sku}, name={raw_name!r}, number={raw_num!r})", "WARN")
+            continue
+        zw, zh = birthday_zone_px(sku)
+        copies = max(1, int(row.get("Quantity") or 1))
+        item = {"name": name, "number": number,
+                "name_colours": birthday_letter_colours(name, palette), "number_colour": num_colour,
+                "label_front": make_zone_label("front", sku), "label_back": make_zone_label("back", sku)}
+        groups.setdefault((tpl_file, zw, zh), []).extend([item] * copies)
+        log(f"  [birthday] {sku}: {gender}  name={name!r}  number={number!r}  x{copies}  zone={zw}x{zh}px", "INFO")
+    if not groups:
+        return False, "No valid birthday rows — name or age number missing"
+
+    try:
+        from ps_bridge import submit_job, wait_for_completion
+    except Exception as e:
+        return False, f"ps_bridge import error: {e}"
+
+    base, ext = os.path.splitext(out_path)
+    n_files = total = 0
+    for (tpl_file, zw, zh), items in groups.items():
+        template_path = os.path.join(TEMPLATES_FOLDER, BIRTHDAY_SUBFOLDER, tpl_file)
+        if not os.path.isfile(template_path):
+            return False, f"Template file not found: {template_path}"
+        copy_h = BIRTHDAY_SMALL_COPY_H_PX if zw < cm_to_px(23) else BIRTHDAY_TEMPLATE_H_PX.get(tpl_file, 7285)
+        per_psd = max(1, (BIRTHDAY_PSD_MAX_H_PX + 126) // (copy_h + 126))
+        for start in range(0, len(items), per_psd):
+            batch      = items[start:start + per_psd]
+            suffix     = "" if n_files == 0 else f"_{chr(ord('a') + n_files)}"      # "", "_b", "_c" ...
+            batch_path = base + suffix + ext
+            n_files   += 1
+            total     += len(batch)
+            log(f"  [birthday] {tpl_file}: {len(batch)} copy(ies) -> {os.path.basename(batch_path)}", "INFO")
+            submit_job(
+                order_id      = order_id,
+                template_path = template_path,
+                zones         = {},
+                output_path   = batch_path,
+                combined      = False,
+                job_type      = "semi_custom",
+                quantity      = len(batch),
+                canvas_h_px   = zh,
+                items         = batch,
+                extra         = {"birthday": True, "zone_w_px": zw, "zone_h_px": zh},
+            )
+            if not wait_for_completion(order_id, timeout_sec=max(600, 200 * len(batch))):
+                return False, f"Photoshop job timed out or errored ({os.path.basename(batch_path)})"
+    return True, f"-> {os.path.basename(out_path)}  ({total} birthday tee(s), {n_files} PSD(s))"
+
+
 def _build_psd_semi_custom(order_id, rows, out_path):
     """
     Process semi-customised rows (e.g. football jerseys with player name + number).
@@ -4154,20 +4287,25 @@ def run_batch(limit=None, order_id_filter=None, dry_run=False, sku_filter=None, 
             order_groups[oid] = []
         order_groups[oid].append(row)
 
-    # An order that mixes hoodie-template rows with other products (e.g. a kids tee + a football hoodie) is
-    # split in two: the hoodie rows go through the hoodie path, the rest through the normal path. Without this
-    # the whole order was routed by its FIRST row, so a hoodie row was built as a plain text zone (or the
-    # hoodie path rejected the order because of the non-hoodie row).
+    # An order that mixes rows of different kinds - hoodie templates, birthday templates, everything else (e.g. a kids
+    # tee + a football hoodie) - is split into one entry per kind, each going through its own builder. Without this
+    # the whole order was routed by its FIRST row, so a template row was built as a plain text zone (or the template
+    # path rejected the order because of the other rows).
+    def _row_kind(r):
+        _s = (r.get("SKU") or "").strip()
+        return "hoodie" if get_hoodie_design(_s) else ("birthday" if get_birthday_design(_s) else "other")
     order_list = []
     for _oid, _rows in order_groups.items():
-        _hood  = [r for r in _rows if get_hoodie_design((r.get("SKU") or "").strip())]
-        _other = [r for r in _rows if not get_hoodie_design((r.get("SKU") or "").strip())]
+        _by_kind = OrderedDict()
+        for _r in _rows:
+            _by_kind.setdefault(_row_kind(_r), []).append(_r)
         # An order with any embroidery / rhinestone row stays whole: it is skipped for manual handling as before,
         # never half-built.
-        if _hood and _other and not any(is_emb_rhine_row(r) for r in _rows):
-            log(f"  {_oid}: mixed order - {len(_hood)} hoodie row(s) + {len(_other)} other row(s) built as two PSDs", "INFO")
-            order_list.append((_oid, _hood))
-            order_list.append((_oid, _other))
+        if len(_by_kind) > 1 and not any(is_emb_rhine_row(r) for r in _rows):
+            log(f"  {_oid}: mixed order - " + " + ".join(f"{len(v)} {k} row(s)" for k, v in _by_kind.items())
+                + f" built as {len(_by_kind)} PSD group(s)", "INFO")
+            for _v in _by_kind.values():
+                order_list.append((_oid, _v))
         else:
             order_list.append((_oid, _rows))
 
@@ -4319,7 +4457,8 @@ def run_batch(limit=None, order_id_filter=None, dry_run=False, sku_filter=None, 
         # Orders tagged SemiCustomized but with no template go through normal processing.
         _cat = (first_row.get("CustomizationCategory") or "").strip().lower()
         _is_hoodie     = get_hoodie_design(sku_raw) is not None
-        is_semi_custom = _is_hoodie or (_cat == "semicustomized" and get_semi_custom_template(sku_raw) is not None)
+        _is_birthday   = get_birthday_design(sku_raw) is not None
+        is_semi_custom = _is_hoodie or _is_birthday or (_cat == "semicustomized" and get_semi_custom_template(sku_raw) is not None)
 
         if is_semi_custom:
             # Override output path → Output\<date>\semicustomized\
@@ -4366,6 +4505,8 @@ def run_batch(limit=None, order_id_filter=None, dry_run=False, sku_filter=None, 
                 # are stacked onto one canvas instead of only processing row 1.
                 if _is_hoodie:
                     ok, msg = _build_psd_hoodie(order_id, group_rows, out_path)
+                elif _is_birthday:
+                    ok, msg = _build_psd_birthday(order_id, group_rows, out_path)
                 else:
                     ok, msg = _build_psd_semi_custom(order_id, group_rows, out_path)
                 if not ok:

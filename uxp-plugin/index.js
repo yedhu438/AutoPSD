@@ -2,7 +2,7 @@ const {app,core,action,constants} = require("photoshop");
 const uxp = require("uxp");
 const fs  = uxp.storage.localFileSystem;
 
-const PLUGIN_VERSION = "v3.13c-hoodie-groups";
+const PLUGIN_VERSION = "v3.14c-birthday";
 const POLL_MS   = 3000;
 const LABEL_PX  = 126;  // 1cm at 320dpi (halved from 2cm)
 const GAP_PX    = 126;  // 1cm gap between zones
@@ -529,6 +529,160 @@ async function applyHoodieName(name, fitW, fitH, cropW, docRef, label, groupName
   return {w:b.w, h:b.h, scale:scale};
 }
 
+// ── Birthday Top kids tees: the template holds a "front" zone (fixed artwork) and a "back" zone (name + age number) ──
+// The name gets ONE COLOUR PER LETTER (item.name_colours, null for spaces), the number one colour. Text stays live.
+function hexToRgbObj(hex){
+  const h = String(hex).replace("#","");
+  return {_obj:"RGBColor", red:parseInt(h.slice(0,2),16), grain:parseInt(h.slice(2,4),16), blue:parseInt(h.slice(4,6),16)};
+}
+// Replace the text of a template text layer, colour it, and give it back the template's size (replacing the text makes
+// Photoshop drop the layer's scale factor, exactly as seen on the hoodies). colours: one hex (or null) per character, or
+// a single hex string for the whole text.
+async function replaceTemplateText(tl, text, colours){
+  const id = tl.id;
+  const sel = async () => { await bp([{_obj:"select",_target:[{_ref:"layer",_id:id}],makeVisible:false}]); };
+  await sel();
+  const before = await getLayerBounds();
+  let szBefore = null, fontPS = null;
+  try{ szBefore = tl.textItem.characterStyle.size; }catch(e){}
+  try{ fontPS = tl.textItem.characterStyle.font; }catch(e){}
+  tl.textItem.contents = text;
+  // A style range REPLACES the whole style: with only a colour in it, Photoshop falls back to Myriad Pro at a default
+  // size (seen in the first test). So every range carries the template's font and size again, plus the colour.
+  const baseStyle = {fontPostScriptName: fontPS || "MagicalSnow", fontName:"Magical Snow", fontStyleName:"Regular"};
+  if(szBefore) baseStyle.size = {_unit:"pointsUnit", _value:szBefore};
+  const mk = (from, to, hex) => ({_obj:"textStyleRange", from:from, to:to, textStyle:{_obj:"textStyle", ...baseStyle, color:hexToRgbObj(hex)}});
+  const ranges = [];
+  if(typeof colours === "string"){
+    if(text.length) ranges.push(mk(0, text.length, colours));
+  } else if(Array.isArray(colours)){
+    // Every character gets a range - also the spaces (colour null): a character without its own range falls back to a
+    // default style and a tiny size, which made the space between two words vanish. A space takes the previous colour.
+    let lastHex = colours.find(c => c) || null;
+    for(let i = 0; i < text.length; i++){
+      if(colours[i]){ lastHex = colours[i]; ranges.push(mk(i, i+1, colours[i])); }
+      else if(lastHex) ranges.push(mk(i, i+1, lastHex));
+    }
+  }
+  if(ranges.length){
+    await sel();
+    await bpc([{_obj:"set",_target:[{_ref:"textLayer",_enum:"ordinal",_value:"targetEnum"}],to:{_obj:"textLayer",textStyleRange:ranges}}], "colour letters");
+  }
+  let szAfter = null; try{ szAfter = tl.textItem.characterStyle.size; }catch(e){}
+  await sel();
+  let b = await getLayerBounds();
+  let restore = 1;
+  if(szBefore && szAfter && szAfter < szBefore*0.9) restore = szBefore/szAfter;
+  else if(before.h > 0 && b.h > 0 && b.h < before.h*0.7) restore = before.h/b.h;     // fallback: compare glyph heights
+  if(restore > 1.1){
+    await bp([{_obj:"transform",null:{_ref:[{_ref:"layer",_enum:"ordinal",_value:"targetEnum"}]},
+      freeTransformCenterState:{_enum:"quadCenterState",_value:"QCSAverage"},
+      width:{_unit:"percentUnit",_value:restore*100},height:{_unit:"percentUnit",_value:restore*100},
+      constrainProportions:true,interfaceIconFrameDimmed:{_enum:"interpolationType",_value:"bicubicAutomatic"}}]);
+    b = await getLayerBounds();
+  }
+  trace("text '"+text+"': font "+fontPS+", size "+szBefore+" -> "+szAfter+", restore x"+restore.toFixed(2)+", box "+Math.round(b.w)+"x"+Math.round(b.h)+" (template "+Math.round(before.w)+"x"+Math.round(before.h)+")");
+  return {before:before, after:b};
+}
+// Scale a layer about its own centre (only when factor < 1), then put its centre at (cxT, cyT).
+async function placeLayer(l, factor, cxT, cyT){
+  await bp([{_obj:"select",_target:[{_ref:"layer",_id:l.id}],makeVisible:false}]);
+  let b = await getLayerBounds();
+  if(factor < 0.995){
+    await bp([{_obj:"transform",null:{_ref:[{_ref:"layer",_enum:"ordinal",_value:"targetEnum"}]},
+      freeTransformCenterState:{_enum:"quadCenterState",_value:"QCSAverage"},
+      width:{_unit:"percentUnit",_value:factor*100},height:{_unit:"percentUnit",_value:factor*100},
+      constrainProportions:true,interfaceIconFrameDimmed:{_enum:"interpolationType",_value:"bicubicAutomatic"}}]);
+    b = await getLayerBounds();
+  }
+  await moveLayerBy(Math.round(cxT - (b.left + b.right)/2), Math.round(cyT - (b.top + b.bottom)/2));
+  return b;
+}
+function layerBox(l){ const b = l.bounds; return {left:b.left, top:b.top, right:b.right, bottom:b.bottom}; }
+function unionBox(a){
+  return {left:Math.min(...a.map(x=>x.left)), top:Math.min(...a.map(x=>x.top)), right:Math.max(...a.map(x=>x.right)), bottom:Math.max(...a.map(x=>x.bottom))};
+}
+
+// Build ONE birthday tee in the given (template) document: texts, colours, labels, zone layout, canvas, one layer group.
+// Ages 5+ keep the template's own layout (zone canvas 23 x 30 cm); ages 1-4 (zone 16 x 16 cm) get every zone scaled to
+// fit its 16 x 16 cm block below the standard label strip, and the canvas is cut to the zone width.
+async function applyBirthdayCopy(doc, item, job, groupName){
+  await selectDocById(doc);
+  const MARGIN_PX = 38, EDGE_PX = 38, ZGAP = 126;
+  const zoneW = job.zone_w_px || 2898, zoneH = job.zone_h_px || 3780;
+  const {w:docW0, h:docH0} = await getDocSize();
+
+  // 1. find the template's layers
+  let frontLbl = null, backLbl = null, nameL = null, numL = null;
+  const art = [];
+  for(const l of doc.layers){
+    if(l.kind === "text"){
+      const c = String(l.textItem.contents || "").trim(), nm = String(l.name || "").trim().toLowerCase();
+      if(nm === "front") frontLbl = l; else if(nm === "back") backLbl = l;
+      else if(/^\d+$/.test(c)) numL = l; else nameL = l;
+    } else if(l.kind !== "group"){
+      const bb = l.bounds;
+      if((bb.right - bb.left) > 0 && (bb.bottom - bb.top) > 0) art.push(l);
+    }
+  }
+  if(!nameL || !numL || !backLbl) throw new Error("Birthday template: name / number / back label layer not found");
+  const backTop0 = backLbl.bounds.top;
+  const frontArt = art.filter(l => l.bounds.top < backTop0);
+  const nb0 = layerBox(nameL), mb0 = layerBox(numL);
+  const fa = frontArt.length ? unionBox(frontArt.map(layerBox)) : null;
+  const ba = unionBox([nb0, mb0]);
+
+  // 2. the customer's name and number, coloured
+  const nameRes = await replaceTemplateText(nameL, item.name, item.name_colours);
+  const numRes  = await replaceTemplateText(numL, item.number, item.number_colour);
+
+  // 3. layout
+  const small = zoneW < docW0;
+  const strip = labelStrip(zoneW);
+  let sF = 1, sB = 1, frontTop = 0, backTop = backTop0, frontContentTop = 0, backContentTop = 0, totalH = docH0;
+  if(small){
+    const aw = zoneW - 2*MARGIN_PX, ah = zoneH - strip - 2*EDGE_PX;
+    if(fa) sF = Math.min(1, aw/(fa.right - fa.left), ah/(fa.bottom - fa.top));
+    sB = Math.min(1, aw/(ba.right - ba.left), ah/(ba.bottom - ba.top));
+    frontContentTop = strip + EDGE_PX;
+    const frontH = fa ? strip + EDGE_PX + (fa.bottom - fa.top)*sF + EDGE_PX : 0;
+    backTop = frontH + (fa ? ZGAP : 0);
+    backContentTop = backTop + strip + EDGE_PX;
+    totalH = Math.round(backContentTop + (ba.bottom - ba.top)*sB + EDGE_PX);
+    // front artwork: every layer scaled by sF about its own centre, positions kept relative to the union
+    if(fa){
+      const ucx = (fa.left + fa.right)/2;
+      for(const l of frontArt){
+        const b = layerBox(l);
+        await placeLayer(l, sF, zoneW/2 + ((b.left + b.right)/2 - ucx)*sF, frontContentTop + ((b.top + b.bottom)/2 - fa.top)*sF);
+      }
+    }
+  }
+  const textScale = small ? sB : 1;
+  const availW = zoneW - 2*MARGIN_PX;
+  for(const [l, tb, res] of [[nameL, nb0, nameRes], [numL, mb0, numRes]]){
+    const f = Math.min(1, availW/((res.after.w * textScale) || 1));          // long names shrink to fit the zone width
+    const c0y = (tb.top + tb.bottom)/2;
+    const cyT = small ? backContentTop + (c0y - ba.top)*sB : c0y;            // vertical centre of the template placeholder
+    await placeLayer(l, textScale * f, zoneW/2, cyT);
+  }
+
+  // 4. standard labels instead of the template's own front / back labels
+  if(frontLbl) frontLbl.delete();
+  backLbl.delete();
+  if(item.label_front && fa) await addLabel(item.label_front, frontTop, zoneW, zoneW);
+  if(item.label_back) await addLabel(item.label_back, backTop, zoneW, zoneW);
+
+  // 5. canvas: the template's own for ages 5+, the 16 cm zone width for ages 1-4
+  if(small) await doc.resizeCanvas(zoneW, totalH, constants.AnchorPosition.TOPLEFT);
+  trace("birthday '"+item.name+"' "+item.number+": zone "+zoneW+"x"+zoneH+(small ? ", scale front "+sF.toFixed(2)+" back "+sB.toFixed(2)+", canvas "+zoneW+"x"+totalH : ", template layout kept")+", back label at y="+Math.round(backTop));
+
+  // 6. everything into ONE layer group (name / number / labels stay live text)
+  await bpc([{_obj:"selectAllLayers",_target:[{_ref:"layer",_enum:"ordinal",_value:"targetEnum"}]}], "select all layers");
+  await bpc([{_obj:"make",_target:[{_ref:"layerSection"}],from:{_ref:"layer",_enum:"ordinal",_value:"targetEnum"}}], "group layers");
+  await bp([{_obj:"set",null:{_ref:[{_enum:"ordinal",_value:"targetEnum",_ref:"layer"}]},to:{_obj:"layer",name:groupName}}]);
+}
+
 // ── Main job processor ────────────────────────────────────────────────────────
 async function processJob(jobEntry){
   let job, orderId=jobEntry.name.replace(".json","");
@@ -612,10 +766,16 @@ async function processJob(jobEntry){
           }
         }
 
-        if(job.hoodie){
+        if(job.hoodie || job.birthday){
           // ── Football / gymnastic hoodie: write each name into the template, stack copies 1 cm apart ──────
           const fitW = job.fit_w_px || 2268, fitH = job.fit_h_px || 693, cropW = job.crop_w_px || 2520;
           const HGAP = 126;
+          const pfx = job.birthday ? "Birthday" : "Hoodie";
+          // one copy = one layer group; the builder differs per template family
+          const buildCopy = async (d, it, gName) => {
+            if(job.birthday) await applyBirthdayCopy(d, it, job, gName);
+            else await applyHoodieName(it.name, fitW, fitH, cropW, d, it.label, gName);
+          };
           dbg("hoodie start");
           // Re-opening the template file does not give a second, independent copy (the edits of copy 2 landed in
           // the first document). So: make one pristine spare with duplicate() now, before the main document is
@@ -627,8 +787,7 @@ async function processJob(jobEntry){
           }
           let copyDoc = null;
           try{
-          await applyHoodieName(items[0].name, fitW, fitH, cropW, doc, items[0].label,
-            items.length > 1 ? "Hoodie_1_"+items[0].name : "Hoodie_"+items[0].name);
+          await buildCopy(doc, items[0], items.length > 1 ? pfx+"_1_"+items[0].name : pfx+"_"+items[0].name);
           const {w:tplW, h:tplH} = await getDocSize();               // cropW x 3780 after the crop
           log("Hoodie 1/"+items.length+": "+items[0].name);
           dbg("hoodie 1 done");
@@ -640,10 +799,10 @@ async function processJob(jobEntry){
               copyDoc = copy;
               await selectDocById(copy);
               dbg("copy "+(k+1)+" made");
-              await applyHoodieName(items[k].name, fitW, fitH, cropW, copy, items[k].label, "Hoodie_"+(k+1)+"_"+items[k].name);
+              await buildCopy(copy, items[k], pfx+"_"+(k+1)+"_"+items[k].name);
               // No clipboard: the copy is one layer GROUP (design + live name + label, left selected); send that group to
               // the main document and place it by its own bounds: same x, y shifted by this copy's slot offset.
-              const gName = "Hoodie_"+(k+1)+"_"+items[k].name;
+              const gName = pfx+"_"+(k+1)+"_"+items[k].name;
               const ref0  = hoodieRef(copy, gName);                    // name text position inside the copy (exact)
               await bpc([{_obj:"duplicate",_target:[{_ref:"layer",_enum:"ordinal",_value:"targetEnum"}],
                 to:{_ref:"document",_id:doc.id},version:5}], "send group to main document");
