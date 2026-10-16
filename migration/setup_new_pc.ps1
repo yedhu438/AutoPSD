@@ -18,6 +18,7 @@
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File C:\gimpTest\migration\setup_new_pc.ps1 -Check
+  powershell -ExecutionPolicy Bypass -File C:\gimpTest\migration\setup_new_pc.ps1 -Bucket autopsd   (this PC uploads to its own bucket)
   powershell -ExecutionPolicy Bypass -File C:\gimpTest\migration\setup_new_pc.ps1
   powershell -ExecutionPolicy Bypass -File C:\gimpTest\migration\setup_new_pc.ps1 -GoLive
 #>
@@ -28,13 +29,15 @@ param(
     [string]$PythonExe,
     [string]$ServiceUser = ".\$env:USERNAME",
     [string]$DaemonArgs,
+    [string]$Bucket      = 'varsaniautomation',   # B2 bucket for THIS PC (the new PC uses its own: -Bucket autopsd)
     [switch]$Check,
     [switch]$DryRun,
     [switch]$GoLive,
     [switch]$SkipFonts,
     [switch]$SkipService,
     [switch]$SkipB2,
-    [switch]$SkipVerify
+    [switch]$SkipVerify,
+    [switch]$ResetB2Key       # delete the stored B2 key files so the keyID + application key are asked for again
 )
 
 $ErrorActionPreference = 'Stop'
@@ -51,7 +54,6 @@ $NssmExe     = 'C:\nssm\nssm.exe'
 $RcloneDir   = 'C:\rclone'
 $RcloneExe   = Join-Path $RcloneDir 'rclone.exe'
 $Remote      = 'b2varsany'
-$Bucket      = 'varsaniautomation'
 $SysConf     = 'C:\Windows\system32\config\systemprofile\AppData\Roaming\rclone\rclone.conf'
 $NoChange    = $Check.IsPresent -or $DryRun.IsPresent
 $script:Results  = New-Object System.Collections.ArrayList
@@ -347,6 +349,13 @@ function Sync-B2 {
     # B2 credentials: the user profile copy is used by this script, the SYSTEM copy by the scheduled task
     $userConf   = Join-Path $env:APPDATA 'rclone\rclone.conf'
     $bundleConf = Join-Path $BundleDir 'config\rclone.conf'
+    if ($ResetB2Key) {
+        if ($NoChange) { Add-Result 'B2 key reset' 'DRY' 'would delete the stored rclone.conf files so the key is asked for again' }
+        else {
+            foreach ($c in @($userConf, $SysConf)) { if (Test-PathSafe $c) { Remove-Item -LiteralPath $c -Force -ErrorAction SilentlyContinue } }
+            Add-Result 'B2 key reset' 'FIXED' 'old rclone.conf files removed - the key is asked for again'
+        }
+    }
     if (-not (Test-Path -LiteralPath $userConf)) {
         if ($Check)  { Add-Result 'rclone.conf (user)' 'WARN' 'missing' }
         elseif ($DryRun) { Add-Result 'rclone.conf (user)' 'DRY' 'would copy from the bundle, or ask for the B2 keyID + application key' }
@@ -354,8 +363,13 @@ function Sync-B2 {
             New-Item -ItemType Directory -Force -Path (Split-Path $userConf) | Out-Null
             if (Test-Path -LiteralPath $bundleConf) { Copy-Item -LiteralPath $bundleConf -Destination $userConf -Force; Add-Result 'rclone.conf (user)' 'FIXED' 'copied from the bundle' }
             else {
-                $id  = Read-Host 'Backblaze B2 keyID (starts with 003...)'
-                $key = Read-SecretText 'Backblaze B2 applicationKey (input hidden)'
+                $id = ''
+                for ($try = 1; $try -le 3; $try++) {
+                    $id = ([string](Read-Host 'Backblaze B2 keyID (starts with 003...)')).Trim()
+                    if ($id.Length -eq 25 -and $id.StartsWith('003')) { break }
+                    Write-Host ('That keyID has {0} characters - a Backblaze keyID has exactly 25 and starts with 003. Copy it from the Backblaze page and paste it, do not retype it.' -f $id.Length) -ForegroundColor Yellow
+                }
+                $key = ([string](Read-SecretText 'Backblaze B2 applicationKey (input hidden)')).Trim()
                 $text = "[$Remote]`r`ntype = b2`r`naccount = $id`r`nkey = $key`r`n"
                 [IO.File]::WriteAllText($userConf, $text, (New-Object Text.UTF8Encoding($false)))
                 $key = $null; $text = $null
@@ -364,8 +378,16 @@ function Sync-B2 {
         }
     } else { Add-Result 'rclone.conf (user)' 'OK' $userConf }
 
-    if (Test-PathSafe $SysConf) { Add-Result 'rclone.conf (SYSTEM)' 'OK' 'present' }
-    elseif ($Check)  { Add-Result 'rclone.conf (SYSTEM)' 'WARN' 'not found or not readable without admin - the scheduled task runs as SYSTEM and needs it' }
+    $sysExists  = Test-PathSafe $SysConf
+    $sysDiffers = $false
+    if ($sysExists -and (Test-Path -LiteralPath $userConf)) {
+        try { $sysDiffers = ((Get-FileHash -LiteralPath $SysConf).Hash -ne (Get-FileHash -LiteralPath $userConf).Hash) } catch { $sysDiffers = $false }
+    }
+    if ($sysExists -and -not $sysDiffers) { Add-Result 'rclone.conf (SYSTEM)' 'OK' 'present, same as the user copy' }
+    elseif ($Check)  {
+        if ($sysExists) { Add-Result 'rclone.conf (SYSTEM)' 'WARN' 'differs from the user copy - run the script without -Check to refresh it' }
+        else { Add-Result 'rclone.conf (SYSTEM)' 'WARN' 'not found or not readable without admin - the scheduled task runs as SYSTEM and needs it' }
+    }
     elseif ($DryRun) { Add-Result 'rclone.conf (SYSTEM)' 'DRY' 'would copy the user config into the SYSTEM profile' }
     elseif (Test-Path -LiteralPath $userConf) {
         New-Item -ItemType Directory -Force -Path (Split-Path $SysConf) | Out-Null
@@ -380,17 +402,32 @@ function Sync-B2 {
         else { Add-Result 'B2 connection' 'FAIL' ((($out -split "`r?`n") | Select-Object -Last 2) -join ' | ') }
     }
 
-    # sync_to_b2.bat must call the full rclone path (a bare "rclone" is invisible to SYSTEM)
+    # the bucket is per PC: b2_bucket.txt (git-ignored) is read by sync_to_b2.bat; without it the production bucket is used
+    $bucketFile = Join-Path $ProjectDir 'b2_bucket.txt'
+    $curBucket  = 'varsaniautomation'
+    if (Test-Path -LiteralPath $bucketFile) { $curBucket = ([string](Get-Content -LiteralPath $bucketFile -TotalCount 1)).Trim() }
+    if ($curBucket -eq $Bucket) { Add-Result 'B2 bucket file' 'OK' ("uploads go to '{0}'" -f $Bucket) }
+    elseif ($Check)  { Add-Result 'B2 bucket file' 'WARN' ("this PC would upload to '{0}' but -Bucket is '{1}'" -f $curBucket, $Bucket) }
+    elseif ($DryRun) { Add-Result 'B2 bucket file' 'DRY' ("would write {0} = {1}" -f $bucketFile, $Bucket) }
+    else {
+        [IO.File]::WriteAllText($bucketFile, $Bucket, (New-Object Text.UTF8Encoding($false)))
+        Add-Result 'B2 bucket file' 'FIXED' ("{0} = {1}" -f $bucketFile, $Bucket)
+    }
+
+    # sync_to_b2.bat must call the full rclone path (a bare "rclone" is invisible to SYSTEM) and read the bucket from b2_bucket.txt
     $bat = Join-Path $ProjectDir 'sync_to_b2.bat'
-    $batOk = (Test-Path -LiteralPath $bat) -and (Select-String -LiteralPath $bat -SimpleMatch $RcloneExe -Quiet)
-    if ($batOk) { Add-Result 'sync_to_b2.bat' 'OK' 'calls the full rclone path' }
-    elseif ($Check)  { Add-Result 'sync_to_b2.bat' 'WARN' 'missing or still calls a bare "rclone" (stale commit?)' }
+    $batOk = (Test-Path -LiteralPath $bat) -and (Select-String -LiteralPath $bat -SimpleMatch $RcloneExe -Quiet) -and (Select-String -LiteralPath $bat -SimpleMatch 'b2_bucket.txt' -Quiet)
+    if ($batOk) { Add-Result 'sync_to_b2.bat' 'OK' 'calls the full rclone path, bucket from b2_bucket.txt' }
+    elseif ($Check)  { Add-Result 'sync_to_b2.bat' 'WARN' 'missing, calls a bare "rclone", or does not read b2_bucket.txt (stale commit?)' }
     elseif ($DryRun) { Add-Result 'sync_to_b2.bat' 'DRY' 'would rewrite it with the known-good content' }
     else {
         $lines = @(
             '@echo off',
+            'rem The bucket is per PC: b2_bucket.txt (git-ignored) holds its name. Without that file the production bucket is used.',
+            'set "B2BUCKET=varsaniautomation"',
+            ('if exist "{0}" set /p B2BUCKET=<"{0}"' -f $bucketFile),
             ':loop',
-            ('"{0}" copy "{1}" {2}:{3} --log-file="{4}" --log-level INFO --timeout 30s --contimeout 10s' -f $RcloneExe, (Join-Path $ProjectDir 'Output'), $Remote, $Bucket, (Join-Path $ProjectDir 'rclone_sync.log')),
+            ('"{0}" copy "{1}" {2}:%B2BUCKET% --log-file="{3}" --log-level INFO --timeout 30s --contimeout 10s' -f $RcloneExe, (Join-Path $ProjectDir 'Output'), $Remote, (Join-Path $ProjectDir 'rclone_sync.log')),
             'timeout /t 5 /nobreak',
             'goto loop'
         )

@@ -57,3 +57,6 @@ trigger_ps.vbs
 # in-flight job queue (job JSONs contain customer personalisation data)
 migration/bundle/
 jobs/
+
+# Per-PC Backblaze bucket name read by sync_to_b2.bat (the new PC uses its own bucket)
+b2_bucket.txt

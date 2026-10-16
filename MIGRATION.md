@@ -20,7 +20,7 @@ the B2 key, `nssm.exe`/`rclone.exe`, the service settings, the pinned package li
 | Fonts | 1,108 custom .ttf/.otf installed in `C:\Windows\Fonts` and the per-user fonts folder | no | `bundle\fonts` + `install_fonts.py` |
 | Jersey template | `template\england Football Adult.psd` (276 MB) - the only semi-custom template that exists | no | bundle |
 | Chrome | headless Chrome renders the premium SVG colour fonts | - | winget |
-| B2 upload | rclone to bucket `varsaniautomation`, SYSTEM scheduled task `VarsanyB2Sync`; the Synology pulls from B2 (nothing to change there) | scripts yes, key no | `setup_new_pc.ps1` + bundle |
+| B2 upload | rclone to a bucket, SYSTEM scheduled task `VarsanyB2Sync`; the Synology pulls from B2 (nothing to change there). Production bucket: `varsaniautomation`. **The bucket is per PC:** `setup_new_pc.ps1 -Bucket <name>` writes the git-ignored `C:\gimpTest\b2_bucket.txt`, which `sync_to_b2.bat` reads (no file = `varsaniautomation`, so the old PC is unchanged). The new PC uses its own bucket `autopsd`; at cutover whatever pulls for printing must be pointed at the bucket the new PC uploads to | scripts yes, key no | `setup_new_pc.ps1 -Bucket autopsd` + bundle |
 | Database | the SQL Server named in `.env`; it only accepts allow-listed IPs | external | ask the DB host (B3) |
 
 **Deliberately not moved:** `Output\` (83 GB, already in B2), `Temp\` (102 GB customer-image cache, re-downloaded on
