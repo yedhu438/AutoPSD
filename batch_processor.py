@@ -16,8 +16,8 @@ Usage:
     python batch_processor.py --dpi 320        # full print resolution
 """
 
-import os, json, struct, io, argparse, traceback, urllib.request, tempfile
-from datetime import datetime
+import os, re, json, struct, io, argparse, traceback, urllib.request, tempfile
+from datetime import datetime, timedelta
 from PIL import Image, ImageDraw, ImageFont, ImageCms
 import pyodbc
 
@@ -179,6 +179,9 @@ def _build_psd_via_photoshop(order_id, row, out_path, force_bg_remove=False, qua
             # Background removal: apply before handing the image to Photoshop.
             # Triggered by force_bg_remove (CLI flag), designer DB flag, or auto-detection.
             img_path = find_image(img_raw) if img_raw else None
+            # Topaz sanity check: another customer's picture from the Topaz service is rejected -> the original upload is used below
+            if img_path and use_topaz and img_raw and _topaz_rejected(row, img_path, side, topaz_col, json_col, img_col):
+                img_path = None
             # If Topaz image download failed, fall back to original image
             if not img_path and use_topaz and img_raw:
                 _orig_files = resolve_zone_images(row, False, topaz_col, json_col, img_col)
@@ -354,6 +357,9 @@ def _build_psd_multi_via_photoshop(order_id, group_rows, out_path, force_bg_remo
                 canvas_h         = max(canvas_h, zone_h)
 
                 img_path = find_image(img_raw) if img_raw else None
+                # Topaz sanity check: another customer's picture from the Topaz service is rejected -> the original upload is used below
+                if img_path and use_topaz and img_raw and _topaz_rejected(row, img_path, side, topaz_col, json_col, img_col):
+                    img_path = None
                 if not img_path and use_topaz and img_raw:
                     _orig_files = resolve_zone_images(row, False, topaz_col, json_col, img_col)
                     _side_idx   = 1 if side == "Right" else 0
@@ -941,7 +947,8 @@ PRODUCT_CANVAS = {
     "knittingbag":    {"front": (cm_to_px(25), cm_to_px(21))},
     # Accessories
     "buckethat":      {"front": (cm_to_px(11), cm_to_px(4))},
-    "beanie":         {"front": (cm_to_px(9.5),cm_to_px(4.5))},
+    "beanie":         {"front": (cm_to_px(9.5),cm_to_px(4.5))},   # patch beanie AnytxtPatchBeanie_Gry/Blk/Nvy (owner, 2026-10-16)
+    "beanietext":     {"front": (cm_to_px(12), cm_to_px(4))},     # text beanie AnytxtBeanie_Gry/Nvy/Blk (owner, 2026-10-16)
     "socks":          {"front": (cm_to_px(6),  cm_to_px(6))},   # one sock = 6×6cm; doubled per-pair below
     "seatbelt":       {"front": (cm_to_px(18), cm_to_px(4))},
     "footballshorts": {"front": (756,          1134)},
@@ -955,6 +962,9 @@ PRODUCT_CANVAS = {
     "golftowel":      {"front": (cm_to_px(17), cm_to_px(17))},
     "golfcase":       {"front": (cm_to_px(15), cm_to_px(6))},
     "slipper":        {"front": (cm_to_px(6),  cm_to_px(6))},
+    # Dog garments (Anytxt_DogTee / DogTshirt / DogHood / DogDenimJckt / DogVarsityJckt ...): the real area depends on the size, see
+    # DOG_PRINT_AREA_CM / get_product_canvas. This entry is only the fallback (size L).
+    "doggarment":     {"front": (cm_to_px(18), cm_to_px(23))},
     # Default fallback
     "default":        {"front": (cm_to_px(30), cm_to_px(30)), "back": (cm_to_px(30), cm_to_px(30)), "pocket": (cm_to_px(9), cm_to_px(9))},
 }
@@ -1071,8 +1081,34 @@ def kids_upper_age(sku):
     lo, hi = int(digits[:mid]), int(digits[mid:])
     return hi if hi > lo else None     # "1-0" / "1-1" are really single ages (10, 11), not a range
 
+# Dog garments (owner's size table, 2026-10-16): MAX PRINT SIZE by garment size, written L x W in the owner's table. L = LENGTH along the
+# dog's back = the canvas HEIGHT, W = WIDTH across the back = the canvas WIDTH, so every area is portrait (or square). The same table
+# is used for every dog listing (tee, T-shirt, hoodie, denim jacket, varsity jacket). Value = (width W cm, length L cm).
+DOG_PRINT_AREA_CM = {
+    "XS":  (10, 10),
+    "S":   (10, 15),
+    "M":   (15, 18),
+    "L":   (18, 23),
+    "XL":  (18, 23),
+    "XXL": (18, 23),
+}
+
+def dog_size(sku):
+    """Garment size ('XS' ... 'XXL') of a dog-garment SKU (Anytxt_DogTeeBlkXL -> 'XL'); None when it is not a sized dog garment."""
+    import re as _re
+    s = sku or ""
+    if not s.lower().startswith("anytxt_dog"):
+        return None
+    m = _re.search(r"(XXL|XL|XS|S|M|L)$", s.split("_", 1)[1])        # sizes are upper-case, the colour code ("Blk") before them is not
+    return m.group(1) if m and m.group(1) in DOG_PRINT_AREA_CM else None
+
 def get_product_canvas(sku, product):
-    """PRODUCT_CANVAS entry for this SKU: the product's sheet size, except kids aged 1-4 (16 x 16 cm front/back)."""
+    """PRODUCT_CANVAS entry for this SKU: the product's sheet size, except kids aged 1-4 (16 x 16 cm front/back) and dog garments (by size)."""
+    if product == "doggarment":
+        _sz = dog_size(sku)
+        if _sz:
+            _w_cm, _l_cm = DOG_PRINT_AREA_CM[_sz]
+            return {"front": (cm_to_px(_w_cm), cm_to_px(_l_cm))}
     canvas = PRODUCT_CANVAS.get(product, PRODUCT_CANVAS["default"])
     if product in SMALL_KIDS_PRODUCTS or (sku or "").startswith(SMALL_KIDS_SKU_PREFIXES):
         age = kids_upper_age(sku)
@@ -1123,8 +1159,8 @@ SKU_MAP = [
     ("BabyVest",                      "babyvest"),
     # Bucket Hat
     ("AnyTextHat_",                   "buckethat"),
-    # Beanie
-    ("AnytxtBeanie_",                 "beanie"),
+    # Beanie: text beanie 12 x 4 cm ("beanietext"); the patch beanie (AnytxtPatchBeanie_) is 9.5 x 4.5 cm ("beanie", see detect_product)
+    ("AnytxtBeanie_",                 "beanietext"),
     # Make Up Bag
     ("AnyTxtMakUp_",                  "makeupbag"),
     # Hoodie Blanket
@@ -1227,6 +1263,75 @@ def find_image(filename):
     except Exception as e:
         log(f"  Image download failed ({filename}): {e}", "WARN")
         return None
+
+# ── Topaz sanity check ────────────────────────────────────────────────────────
+# The Topaz upscaling service (external; it writes the *-Topaz.jpg / .png files the images come from) has returned ANOTHER
+# customer's picture for some items (seen 2026-10-16: 4 of 49 orders - e.g. a towel order got a stranger's photo). A Topaz file is
+# only used while it still looks like the customer's own upload: small edge maps of both are compared (on 67 real pairs the
+# right ones scored >= 0.98, the wrong ones <= 0.13). A mismatch falls back to the original upload; a pair that cannot be
+# checked (original not downloadable, unreadable file) is trusted as before.
+TOPAZ_MATCH_MIN = 0.6
+
+def _topaz_edge_maps(path, n=48):
+    """Small edge maps of a picture (EXIF rotation applied, transparency shown over black and over white)."""
+    from PIL import Image as _I, ImageOps as _O, ImageFilter as _F
+    im = _I.open(path)
+    im.draft("RGB", (n * 4, n * 4))
+    im = _O.exif_transpose(im).convert("RGBA")
+    im.thumbnail((n * 4, n * 4))
+    maps = []
+    for bg in ((0, 0, 0, 255), (255, 255, 255, 255)):
+        b = _I.new("RGBA", im.size, bg)
+        b.alpha_composite(im)
+        e = b.convert("L").resize((n, n)).filter(_F.FIND_EDGES)
+        maps.append(list(getattr(e, "get_flattened_data", e.getdata)()))
+    return maps
+
+def _topaz_map_corr(a, b):
+    ma, mb = sum(a) / len(a), sum(b) / len(b)
+    num = sum((x - ma) * (y - mb) for x, y in zip(a, b))
+    da = sum((x - ma) ** 2 for x in a) ** 0.5
+    db = sum((y - mb) ** 2 for y in b) ** 0.5
+    return num / (da * db) if da > 1e-6 and db > 1e-6 else 1.0       # a flat picture has nothing to compare: never reject it
+
+_TOPAZ_VERDICT = {}
+
+def topaz_matches_original(topaz_path, original_name):
+    """True / False / None: is the Topaz picture an upscale of the customer's own upload? None = could not be checked."""
+    key = (topaz_path, original_name)
+    if key in _TOPAZ_VERDICT:
+        return _TOPAZ_VERDICT[key]
+    verdict = None
+    try:
+        import time as _t
+        orig_path = None
+        for _attempt in range(3):                                      # the image server sometimes times out: try again
+            orig_path = find_image(original_name)                      # cached like every other image
+            if orig_path:
+                break
+            _t.sleep(2)
+        if orig_path and os.path.isfile(orig_path) and os.path.isfile(topaz_path):
+            a, b = _topaz_edge_maps(topaz_path), _topaz_edge_maps(orig_path)
+            best = max(_topaz_map_corr(x, y) for x in a for y in b)
+            verdict = best >= TOPAZ_MATCH_MIN
+            if not verdict:
+                log(f"  TOPAZ MISMATCH: {os.path.basename(topaz_path)} does not look like the customer's upload {original_name} "
+                    f"(similarity {best:.2f}, needs {TOPAZ_MATCH_MIN}) - the original upload is used instead", "WARN")
+    except Exception as e:
+        log(f"  Topaz check skipped for {os.path.basename(topaz_path)}: {e}", "WARN")
+    _TOPAZ_VERDICT[key] = verdict
+    return verdict
+
+def _topaz_rejected(row, topaz_path, side, topaz_col, json_col, img_col):
+    """True when the Topaz file is another customer's picture (the caller then falls back to the original upload)."""
+    try:
+        orig = resolve_zone_images(row, False, topaz_col, json_col, img_col)
+        if not orig:
+            return False
+        idx = 1 if side == "Right" else 0
+        return topaz_matches_original(topaz_path, orig[idx] if len(orig) > idx else orig[0]) is False
+    except Exception:
+        return False
 
 def download_preview(url):
     """Load a preview image from a URL or a local filename, return PIL Image or None."""
@@ -1478,6 +1583,13 @@ def is_multizone_row(row):
         active += 1
     return active > 1
 
+def has_pocket_row(row):
+    """True if the row has a pocket print: pocket text or pocket image(s) - exactly what the builder turns into a 'pocket' zone
+    (or 'pocket left' + 'pocket right'). Owner, 2026-10-16: every order with a pocket print is saved in the Automated folder, also when the
+    pocket is its only zone. (The IsPocketLocation flag is never set on this database and 'pocket' in PrintLocation is sometimes chosen
+    without any pocket design, so the content decides.)"""
+    return bool((row.get("PocketText") or "").strip() or (row.get("PocketImage") or "").strip() or parse_image_json(row.get("PocketImageJSON") or ""))
+
 EMBROIDERY_SKU_PREFIXES = (
     "HandTwlLwnBowl",           # lawn bowls hand towel — embroidery, not DTF
     "Wellis_Pink_Purple",       # not processed by automation
@@ -1489,6 +1601,12 @@ def is_emb_rhine_row(row):
     """True if any zone uses an embroidery or rhinestone font, or SKU is an embroidery-only product."""
     sku = (row.get("SKU") or "")
     if any(sku.startswith(p) for p in EMBROIDERY_SKU_PREFIXES):
+        return True
+    # Stockings: only the PRINT choice is automated (hourly gang sheets). The rhinestone choice ("PERSONALISED - RHINSTONE") and the old
+    # black Stocking##_Mgry SKUs (no template) stay manual - owner decision 2026-10-16.
+    if is_stocking_sku(sku) and "rhin" in (row.get("PrintLocation") or "").lower():
+        return True
+    if is_old_stocking_sku(sku):
         return True
     for field in ("FrontFonts", "BackFonts", "PocketFonts", "SleeveFonts"):
         val = (row.get(field) or "").lower()
@@ -1513,6 +1631,18 @@ def detect_product(sku):
     _sl = sku.lower()
     if "pilow" in _sl or "pillow" in _sl or "cushion" in _sl:
         return "cushion"
+    # Dog garments: Anytxt_DogTeeBlkXL, AnyTxt_DogTshirtBlkM, Anytxt_DogHoodBlkS, Anytxt_DogDenimJcktBlkL ... - one table of print areas by size
+    # (get_product_canvas). Checked before the SKU prefix table so the generic "Anytxt" catch-all (adult T-shirt / default) cannot claim them.
+    # PerDOG01BabyVest and the like are baby / kids garments with a dog design and keep their own product.
+    # Only SKUs whose size the owner's table covers (XS ... XXL) get the dog product; an unsized dog item keeps the previous rules.
+    if _sl.startswith("anytxt_dog") and dog_size(sku):
+        return "doggarment"
+    # Beanies (owner, 2026-10-16): AnytxtBeanie_Gry/Nvy/Blk (text) = 12 x 4 cm; AnytxtPatchBeanie_Gry/Blk/Nvy (patch) = 9.5 x 4.5 cm.
+    # Any other SKU with "beanie" in it (or the spellings bennie / beani / beany) keeps the 9.5 x 4.5 cm beanie, even behind the generic "AnyTxt" prefix.
+    if _sl.startswith("anytxtbeanie"):
+        return "beanietext"
+    if "beani" in _sl or "bennie" in _sl or "beany" in _sl:
+        return "beanie"
     # Longest-prefix match — most specific entry wins over generic catch-alls like "AnyTxt"
     for prefix, product_key in sorted(SKU_MAP, key=lambda x: -len(x[0])):
         if sku.startswith(prefix):
@@ -3000,6 +3130,23 @@ def parse_sku_colour_size(sku):
     return colour_str, size_str
 
 
+DOG_GARMENT_NAMES = (("DogDenimJckt", "Dog Denim Jacket"), ("DogVarsityJckt", "Dog Varsity Jacket"), ("DogTshirt", "Dog T-shirt"),
+                     ("DogTee", "Dog Tee"), ("DogHood", "Dog Hoodie"))
+
+def dog_label_parts(sku):
+    """('Dog Tee', 'Black', 'S') for Anytxt_DogTeeBlkS; None when the SKU is not a sized dog garment."""
+    _sz = dog_size(sku)
+    if not _sz:
+        return None
+    body = sku.split("_", 1)[1][:-len(_sz)]                 # DogTeeBlk
+    colour = ""
+    for code in sorted(COLOUR_MAP.keys(), key=len, reverse=True):
+        if body.endswith(code):
+            colour, body = COLOUR_MAP[code], body[:-len(code)]
+            break
+    garment = next((name for key, name in DOG_GARMENT_NAMES if body.startswith(key)), body)
+    return garment, colour, _sz
+
 def make_zone_label(zone_key, sku, use_sku_detail=True):
     """
     Build the layer label string.
@@ -3009,6 +3156,11 @@ def make_zone_label(zone_key, sku, use_sku_detail=True):
     zone_display = zone_key.title()   # "front" → "Front"
     if not use_sku_detail:
         return zone_display
+    # Dog garments: "Front - Dog Tee - Black - S" (the SKU variant is DogTeeBlkS, which the generic parser cannot split) - the printing team
+    # needs to know WHICH dog garment it is, because tee / T-shirt / hoodie / denim jacket / varsity jacket share one print-area table.
+    _dog = dog_label_parts(sku)
+    if _dog:
+        return " - ".join([zone_display] + [p for p in _dog if p])
     colour, size = parse_sku_colour_size(sku)
     parts = [zone_display]
     if colour:
@@ -3343,6 +3495,520 @@ def _build_psd_birthday(order_id, rows, out_path):
             if not wait_for_completion(order_id, timeout_sec=max(600, 200 * len(batch))):
                 return False, f"Photoshop job timed out or errored ({os.path.basename(batch_path)})"
     return True, f"-> {os.path.basename(out_path)}  ({total} birthday tee(s), {n_files} PSD(s))"
+
+
+# ─── VINYL NAME templates: names / initials / numbers cut in vinyl (template\vynil template.psd) ─────────────────
+# The template is one tall canvas (29.81 x 80 cm) with one hidden GROUP per product (Socks, Wellies, Rainsuit ...), each
+# holding the live text layers of that product (VinylFont names with bevel / stroke / glow effects, JerseyM54 for the
+# football sets). Per the owner: copy the product's whole group into a new canvas, edit only the text and the number
+# (the template's own colours stay - the 'Colours HEX Codes' group is not used), keep the template's text size (shrunk
+# only to the "Max ..cm" in the layer name), then trim the canvas to the artwork - no margin, no label.
+# What is vinyl is decided by the database flag tblCustomOrder.ItemType ("Vinyl", "Vinyl|Red" ...): DTF / Rhinestone / Embroidery /
+# UV Sticker rows are never vinyl, whatever the SKU looks like (SingleBelt_Red / _Grn, NSingleBelt and SeatbeltCover are DTF belts).
+# Only when ItemType is empty does the SKU decide (colour code ending in "V": Rainsuit_RedV_56, BookBagCustom_NvyV ...).
+# A vinyl row is built only if its product has a template group (get_vinyl_group); other vinyl products stay in the normal sweep.
+# Luggage straps (SingleBelt_Blu / Pnk / Ylw / Rainbow; Amazon title "Personalised Luggage Straps For Suitcases"; 61% of all vinyl) use the "Luggage Strap" group: it holds a Black Name and
+# a White Name, and the customer's text colour (#070707 or #ffffff) decides which one is kept.
+VINYL_TEMPLATE_FILE = "vynil template.psd"
+VINYL_SUBFOLDER     = "Vinyl"
+VINYL_GROUP_APPROX_H_PX = {          # rough height of one copy of the group in the template (px), for splitting big quantities
+    "Socks": 1900, "Wellies": 300, "Book Bag": 400, "Hooded Robe": 300, "Rainsuit": 400,
+    "Gloves": 800, "Football Shorts": 1600, "Football SET Socks": 800, "Lunch Box": 900, "Luggage Strap": 400,
+}
+VINYL_PSD_MAX_H_PX = 27000           # stay clear of the 30,000 px PSD height limit
+
+def _vinyl_variant_is_v(sku):
+    parts = (sku or "").split("_")
+    return len(parts) > 1 and parts[1].endswith("V")
+
+VINYL_BELT_COLOURS = ("Blu", "Pnk", "Ylw", "Rainbow")   # SingleBelt colours sold with a vinyl name (Red / Grn / NSingleBelt / SeatbeltCover are DTF)
+
+def get_vinyl_group(sku, db_says_vinyl=False):
+    """Template group for a vinyl SKU, else None. Sensory Board / Hoodie / Football T-shirt have no listing yet.
+    db_says_vinyl: the row's ItemType is Vinyl - then every seat-belt SKU is a vinyl belt; without it only the vinyl belt colours are."""
+    s = (sku or "").strip()
+    if s.startswith(("SingleBelt_", "NSingleBelt_", "SeatbeltCover")):
+        colour = s.split("_", 1)[1] if "_" in s else ""
+        if db_says_vinyl or (s.startswith("SingleBelt_") and colour in VINYL_BELT_COLOURS):
+            return "Luggage Strap"
+        return None
+    if s.startswith("SprtSocks_"):                                            return "Socks"
+    if s.startswith(("BlueWellies_", "Wellies_SuitPnk_", "Wellies_SuitBlu_")): return "Wellies"
+    if s.startswith("BookBagCustom_") and _vinyl_variant_is_v(s):             return "Book Bag"
+    if s.startswith("BabyHoodedTowl_") and _vinyl_variant_is_v(s):            return "Hooded Robe"
+    if s.startswith("Rainsuit_") and _vinyl_variant_is_v(s):                  return "Rainsuit"
+    if s.startswith("FootballGloves_"):                                       return "Gloves"
+    if s.startswith("FootballShorts_"):                                       return "Football Shorts"
+    if s.startswith("FootballShortSocks_"):                                   return "Football SET Socks"
+    if s.startswith("LunchBag_") and _vinyl_variant_is_v(s):                  return "Lunch Box"
+    return None
+
+def row_vinyl_group(row):
+    """Template group when this order row is a vinyl order, else None. The DB flag ItemType decides (see the header comment above);
+    the SKU only decides when ItemType is empty."""
+    sku   = (row.get("SKU") or "").strip()
+    itype = (row.get("ItemType") or "").strip().lower()
+    if itype:
+        return get_vinyl_group(sku, db_says_vinyl=True) if itype.startswith("vinyl") else None
+    return get_vinyl_group(sku)
+
+def _vinyl_text_is_dark(row):
+    """True / False for the customer's text colour (FrontColours Colour1), None when it is missing or unreadable."""
+    import json as _json, re as _re
+    try:
+        c = _json.loads((row.get("FrontColours") or "").strip() or "{}")
+        v = str(c.get("Colour1") or next(iter(c.values()), "") or "")
+    except Exception:
+        v = ""
+    m = _re.fullmatch(r"#?([0-9a-fA-F]{6})", v.strip())
+    if not m:
+        return None
+    h = m.group(1)
+    return (0.299 * int(h[0:2], 16) + 0.587 * int(h[2:4], 16) + 0.114 * int(h[4:6], 16)) < 128
+
+def _vinyl_keep_layer(group, sku, row):
+    """Which of a group's ALTERNATIVE name layers is printed for this order (None = keep them all).
+    Hooded Robe: two names side by side (one per robe colour): pink robe -> "Purple Name - Pink Robe", blue / white robe ->
+    "Dark Blue Name - Blue Robe" (the colours the customers really chose: PnkV #8521de purple, BluV #1e63e4 blue, WhtV #3244dd blue).
+    Luggage Strap (seat-belt covers): a Black Name and a White Name; the customer picked one text colour (#070707 / #ffffff)."""
+    if group == "Hooded Robe":
+        return "Purple Name" if "Pnk" in (sku.split("_")[1] if "_" in sku else "") else "Dark Blue Name"
+    if group == "Luggage Strap":
+        dark = _vinyl_text_is_dark(row)
+        if dark is None:
+            log(f"  [vinyl] {sku}: text colour missing / unreadable - printing the White Name", "WARN")
+        return "Black Name" if dark else "White Name"
+    return None
+
+def _vinyl_texts(row):
+    """(text1, text2) = name / initials and number as typed by the customer."""
+    import json as _json
+    t1, t2 = (row.get("FrontText") or "").strip(), ""
+    try:
+        _j = _json.loads((row.get("FrontTextJSON") or "").strip() or "{}")
+        t1 = str(_j.get("Text1") if _j.get("Text1") is not None else t1)
+        t2 = str(_j.get("Text2") or "")
+    except Exception:
+        pass
+    return " ".join(t1.split()), t2.strip()
+
+def _build_psd_vinyl(order_id, rows, out_path):
+    """
+    Vinyl names: one PSD per order row - the product's template group with the customer's name / number, canvas trimmed to
+    the artwork. Quantity N = N copies stacked 1 cm apart (split into _b, _c ... above ~27,000 px).
+    Returns (success: bool, message: str).
+    """
+    if not PS_BRIDGE_AVAILABLE:
+        return False, "ps_bridge.py not found — cannot process vinyl order"
+    if not _ps_alive():
+        return False, "Photoshop not running — cannot process vinyl order"
+    try:
+        from ps_bridge import submit_job, wait_for_completion
+    except Exception as e:
+        return False, f"ps_bridge import error: {e}"
+    template_path = os.path.join(TEMPLATES_FOLDER, VINYL_TEMPLATE_FILE)
+    if not os.path.isfile(template_path):
+        return False, f"Template file not found: {template_path}"
+
+    base, ext = os.path.splitext(out_path)
+    n_files = total = 0
+    for row in rows:
+        sku   = (row.get("SKU") or "").strip()
+        group = row_vinyl_group(row)
+        if not group:
+            return False, f"No vinyl template group for SKU: {sku}"
+        t1, t2 = _vinyl_texts(row)
+        if not t1 and not t2:
+            log(f"  [vinyl] {sku}: no name / number in the order - nothing to print", "WARN")
+            continue
+        copies  = max(1, int(row.get("Quantity") or 1))
+        per_psd = max(1, VINYL_PSD_MAX_H_PX // (VINYL_GROUP_APPROX_H_PX.get(group, 1000) + 400))
+        # The robe group holds two ALTERNATIVE names side by side (one per robe colour); keep only the one for this robe:
+        # pink robe -> "Purple Name - Pink Robe", blue / white robe -> "Dark Blue Name - Blue Robe" (the colours the
+        # customers really chose: PnkV #8521de purple, BluV #1e63e4 blue, WhtV #3244dd blue).
+        keep = _vinyl_keep_layer(group, sku, row)
+        log(f"  [vinyl] {sku}: group={group!r}  text1={t1!r}  text2={t2!r}  x{copies}" + (f"  keep layer {keep!r}" if keep else ""), "INFO")
+        for start in range(0, copies, per_psd):
+            n          = min(per_psd, copies - start)
+            suffix     = "" if n_files == 0 else f"_{chr(ord('a') + n_files)}"      # "", "_b", "_c" ...
+            batch_path = base + suffix + ext
+            n_files   += 1
+            total     += n
+            log(f"  [vinyl] {group}: {n} copy(ies) -> {os.path.basename(batch_path)}", "INFO")
+            submit_job(
+                order_id      = order_id,
+                template_path = template_path,
+                zones         = {},
+                output_path   = batch_path,
+                combined      = False,
+                job_type      = "semi_custom",
+                quantity      = n,
+                canvas_h_px   = 0,
+                items         = [],
+                extra         = {"vinyl": True, "group": group, "text1": t1, "text2": t2, "copies": n, "keep_layer": keep},
+            )
+            if not wait_for_completion(order_id, timeout_sec=max(600, 120 + 20 * n)):
+                return False, f"Photoshop job timed out or errored ({os.path.basename(batch_path)})"
+    if not n_files:
+        return False, "No vinyl row had a name or number to print"
+    return True, f"-> {os.path.basename(out_path)}  ({total} vinyl set(s), {n_files} PSD(s))"
+
+
+# ─── VINYL HOURLY FILES: the vinyl orders of every clock hour in ONE PSD, 24 x 7 ────────────────────────────────────
+# Per the owner: vinyl orders are processed every hour, around the clock. The orders placed in one clock hour (UK time)
+# become ONE PSD named after that hour, e.g. 2026-10-15_1500-1600.psd, holding several orders, plus a text file of the same
+# name (2026-10-15_1500-1600.txt) with the order ids only. The file is exported when its hour ends - the 15:00-16:00 file at
+# 16:00 - and the windows are clock hours, so no window ever crosses the 4 pm UK order cutoff. The canvas is at most 30 cm
+# wide and 80 cm tall and is CROPPED to the artwork (no empty space); if one hour's orders need more than 80 cm the rest
+# goes into a second file (..._2.psd with ..._2.txt). An hour without vinyl orders produces no file.
+# The daily sweep HOLDS vinyl orders (they stay pending); the daemon builds the finished hours once per clock hour;
+# `--vinyl-batch` does it on demand. VARSANY_VINYL_BATCH=0 builds vinyl orders one by one again.
+# Order timestamps (DateAdd) are UK local time on this database (checked against the server clocks); set VARSANY_DB_TIME=utc
+# if the live database stores UTC.
+VINYL_BATCH_HOLD  = os.environ.get("VARSANY_VINYL_BATCH", "1").strip() != "0"
+VINYL_DB_TIME_UTC = os.environ.get("VARSANY_DB_TIME", "uk").strip().lower() == "utc"
+VINYL_SHEET_W_PX  = cm_to_px(30)                 # 3780 px - the widest a file can be
+VINYL_SHEET_H_PX  = cm_to_px(80)                 # 10079 px - the tallest before a second file is started
+_VINYL_HELD_LOGGED = set()                       # order ids already announced as held (avoid one log line per 30 s sweep)
+_VINYL_WARNED      = set()                       # order ids already warned about (no name / number)
+
+def _uk_now_naive():
+    """Current UK local time (summer time included) as a naive datetime."""
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo("Europe/London")).replace(tzinfo=None)
+
+def _vinyl_order_hour(dt):
+    """The UK clock hour (naive, minutes and seconds cleared) an order timestamp belongs to."""
+    if VINYL_DB_TIME_UTC:
+        from zoneinfo import ZoneInfo
+        from datetime import timezone
+        dt = dt.replace(tzinfo=timezone.utc).astimezone(ZoneInfo("Europe/London")).replace(tzinfo=None)
+    return dt.replace(minute=0, second=0, microsecond=0)
+
+def _vinyl_batch_state_path():
+    return os.path.join(OUTPUT_FOLDER, "vinyl_batch_state.json")
+
+def vinyl_hour_due(now=None):
+    """True once per UK clock hour, 24 x 7: when this hour's run has not happened yet."""
+    import json as _json
+    key = (now or _uk_now_naive()).strftime("%Y-%m-%d %H")
+    try:
+        with open(_vinyl_batch_state_path(), encoding="utf-8") as fh:
+            last = _json.load(fh).get("last_run_hour")
+    except Exception:
+        last = None
+    return last != key
+
+def _vinyl_hour_mark_done(now=None):
+    import json as _json
+    now = now or _uk_now_naive()
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+    with open(_vinyl_batch_state_path(), "w", encoding="utf-8") as fh:
+        _json.dump({"last_run_hour": now.strftime("%Y-%m-%d %H"), "ran_at": now.isoformat(timespec="seconds")}, fh)
+
+_VINYL_TICK = {"enabled": False, "output": None, "last_attempt": 0.0}     # filled by the daemon only
+
+def _vinyl_tick():
+    """Daemon only: once per UK clock hour build the finished vinyl hours. Called between the orders of a sweep as well as
+    after it, so a long queue of other orders (5-7 minutes each) cannot push a vinyl file past its hour - the order in
+    progress finishes, then the file is built. A failed build is retried at most every 10 minutes."""
+    import time as _time
+    t = _VINYL_TICK
+    if not (t["enabled"] and (VINYL_BATCH_HOLD or STOCKING_BATCH_HOLD) and vinyl_hour_due()):
+        return
+    if _time.time() - t["last_attempt"] < 600:
+        return
+    try:
+        rv = run_vinyl_batch(output_folder=t["output"]) if VINYL_BATCH_HOLD else 0
+        rs = run_stocking_batch(output_folder=t["output"]) if STOCKING_BATCH_HOLD else 0      # same hourly schedule: stocking gang sheets
+        if rv >= 0 and rs >= 0:
+            _vinyl_hour_mark_done()
+            return
+    except Exception as e:
+        log(f"Vinyl / stocking hourly build error (will retry): {e}", "FAIL")
+    t["last_attempt"] = _time.time()       # it failed: the next attempt is 10 minutes away at the earliest
+
+def _vinyl_build_hour(items, used_rows, hour_start, output_folder=None, now=None):
+    """Build one hour window (list of order lines) into its PSD file(s) + same-name text file(s). Returns lines placed, -1 on failure."""
+    import json as _json
+    from ps_bridge import submit_job, wait_for_completion, DONE_DIR
+    now      = now or _uk_now_naive()
+    hour_end = hour_start + timedelta(hours=1)
+    name     = f"{hour_start:%Y-%m-%d}_{hour_start:%H%M}-{hour_end:%H%M}"            # e.g. 2026-10-15_1500-1600
+    out_dir  = os.path.join(output_folder if output_folder else os.path.join(OUTPUT_FOLDER, f"{hour_start:%Y-%m-%d}"), VINYL_SUBFOLDER)
+    os.makedirs(out_dir, exist_ok=True)
+    stem     = name
+    if any(os.path.exists(os.path.join(out_dir, stem + suf)) for suf in (".psd", ".txt", "_2.psd")):
+        stem = f"{name}_run{now:%H%M}"                                               # never overwrite an earlier file of that hour
+    template_path = os.path.join(TEMPLATES_FOLDER, VINYL_TEMPLATE_FILE)
+    job_id   = f"VinylBatch_{hour_start:%Y%m%d_%H%M}_{now:%H%M%S}"
+    log(f"Vinyl hour {hour_start:%H:%M}-{hour_end:%H:%M} ({hour_start:%Y-%m-%d}): {len(items)} order line(s) from {len({i['order_id'] for i in items})} order(s)")
+    submit_job(order_id=job_id, template_path=template_path, zones={}, output_path=os.path.join(out_dir, stem + ".psd"), combined=False,
+               job_type="semi_custom", quantity=1, canvas_h_px=0, items=[],
+               extra={"vinyl_sheets": True, "vinyl_items": items, "sheet_stem": os.path.join(out_dir, stem).replace("\\", "/"),
+                      "sheet_w_px": VINYL_SHEET_W_PX, "sheet_h_px": VINYL_SHEET_H_PX})
+    if not wait_for_completion(job_id, timeout_sec=max(900, 300 + 15 * len(items))):
+        log(f"Vinyl hour {name}: Photoshop job failed or timed out - these orders stay pending", "FAIL")
+        return -1
+    try:
+        with open(DONE_DIR / f"{job_id}.json", encoding="utf-8") as fh:
+            sheets = ((_json.load(fh) or {}).get("result") or {}).get("sheets") or []
+    except Exception as e:
+        log(f"Vinyl hour {name}: could not read the plugin result: {e}", "FAIL")
+        return -1
+    if not sheets:
+        log(f"Vinyl hour {name}: the plugin produced no sheet - these orders stay pending", "FAIL")
+        return -1
+    for s in sheets:                                          # one text file per PSD, same name, order ids only
+        ids = sorted({b["order_id"] for b in s.get("blocks", [])})
+        txt_path = os.path.splitext(s["path"])[0] + ".txt"
+        with open(txt_path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(ids) + "\n")
+        log(f"Vinyl hour {name}: {os.path.basename(s['path'])}  ({len(ids)} order(s)) + {os.path.basename(txt_path)}", "OK")
+    for row in used_rows:
+        mark_processed(row["idCustomOrderDetails"])
+    return len(items)
+
+def run_vinyl_batch(order_id_filter=None, reprocess=False, output_folder=None, dry_run=False, date_filter=None, one_window=False):
+    """
+    Build the pending vinyl orders of every FINISHED UK clock hour, one file (or two, if it needs more than 80 cm) per hour:
+    the 15:00-16:00 orders become 2026-10-15_1500-1600.psd + .txt, exported at 16:00. The current, unfinished hour is left for
+    the next run. Orders are marked processed only after their file is saved (never with --no-mark).
+    one_window=True puts everything selected into a single file named after the last finished hour (tests / ad hoc runs).
+    Returns the number of order lines built, 0 when there was nothing to build, -1 when a build failed (those orders stay pending).
+    """
+    log("=" * 60)
+    log("Vinyl hourly batch: collecting pending vinyl orders ...")
+    rows = fetch_orders(order_id_filter=order_id_filter, reprocess=reprocess, date_filter=date_filter)
+    now      = _uk_now_naive()
+    now_hour = now.replace(minute=0, second=0, microsecond=0)
+    buckets  = {}                                              # hour_start -> ([items], [rows])
+    for row in rows:
+        sku   = (row.get("SKU") or "").strip()
+        group = row_vinyl_group(row)
+        if not group or is_emb_rhine_row(row):
+            continue
+        _loc = (row.get("PrintLocation") or "").lower()
+        if "plain" in _loc or "no personalisation" in _loc:      # nothing to print - the sweep marks these complete
+            continue
+        t1, t2 = _vinyl_texts(row)
+        if not t1 and not t2:
+            if row["OrderID"] not in _VINYL_WARNED:
+                _VINYL_WARNED.add(row["OrderID"])
+                log(f"  Vinyl batch: {row['OrderID']} ({sku}) has no name / number - left pending", "WARN")
+            continue
+        keep = _vinyl_keep_layer(group, sku, row)
+        hour = (now_hour - timedelta(hours=1)) if one_window else _vinyl_order_hour(row["DateAdd"])
+        item = {"key": f"{row['OrderID']}|{row['idCustomOrderDetails']}", "order_id": row["OrderID"], "sku": sku, "group": group,
+                "text1": t1, "text2": t2, "copies": max(1, int(row.get("Quantity") or 1)), "keep_layer": keep}
+        b = buckets.setdefault(hour, ([], []))
+        b[0].append(item); b[1].append(row)
+    done_hours = sorted(h for h in buckets if h < now_hour)    # only hours that have finished
+    waiting    = sum(len(buckets[h][0]) for h in buckets if h >= now_hour)
+    if waiting:
+        log(f"Vinyl hourly batch: {waiting} order line(s) of the current hour ({now_hour:%H:00}-{now_hour + timedelta(hours=1):%H:00}) wait for their hour to finish")
+    if not done_hours:
+        log("Vinyl hourly batch: nothing to build.")
+        return 0
+    if dry_run:
+        for h in done_hours:
+            log(f"  [DRY] {h:%Y-%m-%d} {h:%H:%M}-{h + timedelta(hours=1):%H:%M}: {len(buckets[h][0])} order line(s)", "DRY")
+            for it in buckets[h][0]:
+                log(f"  [DRY]     {it['order_id']}  {it['group']:18} {it['text1']!r} {it['text2']!r} x{it['copies']}", "DRY")
+        return 0
+    if not PS_BRIDGE_AVAILABLE or not _ps_alive():
+        log("Vinyl hourly batch: Photoshop / ps_bridge not available - nothing built", "FAIL")
+        return -1
+    if not os.path.isfile(os.path.join(TEMPLATES_FOLDER, VINYL_TEMPLATE_FILE)):
+        log(f"Vinyl hourly batch: template file not found: {os.path.join(TEMPLATES_FOLDER, VINYL_TEMPLATE_FILE)}", "FAIL")
+        return -1
+    built, failed = 0, False
+    for h in done_hours:
+        n = _vinyl_build_hour(buckets[h][0], buckets[h][1], h, output_folder=output_folder, now=now)
+        if n < 0:
+            failed = True
+        else:
+            built += n
+    return -1 if failed else built
+
+
+# ─── STOCKINGS: the PRINT choice, names ganged on 28 x 47 cm sheets, one sheet per UK clock hour and text colour ────────
+# Owner request 2026-10-16 (templates in template\Stockings\): "several names ganged on the sheet, one sheet per hour like the vinyl",
+# name = first letter capital + the rest small, only the PRINT choice (rhinestone choice and the old black Stocking## SKUs stay manual).
+# Each template (SILVER / RED) holds ONE group: the live name layer "Aiden" (KaushanScript + the template's own effects) and a foil
+# texture clipped to it. The plugin copies the group once per name into a new sheet, 2 columns x 8 rows (16 names), reading order,
+# and trims the sheet to the artwork. The text colour of the order picks the template; if it is neither red nor silver the stocking's
+# own colour in the SKU decides. Same hourly machinery as the vinyl files (finished hours only, state file shared with vinyl).
+STOCKING_SUBFOLDER    = "Stockings"
+STOCKING_TEMPLATES    = {"SILVER": os.path.join("Stockings", "Stockings DTF SILVER Template.psd"),
+                         "RED":    os.path.join("Stockings", "Stockings DTF RED Template.psd")}
+STOCKING_SHEET_W_PX   = 3543          # 28.1 cm, the template's own canvas
+STOCKING_SHEET_H_PX   = 5906          # 46.9 cm
+STOCKING_COLS         = 2
+STOCKING_ROWS         = 8             # 16 names per sheet (the owner's first template had exactly this layout)
+STOCKING_PITCH_X_PX   = 1741          # distance between the two columns (13.8 cm)
+STOCKING_PITCH_Y_PX   = 718           # distance between rows (5.7 cm: the 4.5 cm name box + 1.2 cm gap)
+STOCKING_BATCH_HOLD   = os.environ.get("VARSANY_STOCKING_BATCH", "1").strip() != "0"
+_STOCKING_HELD_LOGGED = set()
+_STOCKING_WARNED      = set()
+STOCKING_SKU_RE       = re.compile(r"^(NEWStockings|DGreyStock1?|RedStock1?)_", re.I)
+OLD_STOCKING_SKU_RE   = re.compile(r"^Stocking\d\d_", re.I)
+
+def is_stocking_sku(sku):
+    return bool(STOCKING_SKU_RE.match(sku or ""))
+
+def is_old_stocking_sku(sku):
+    return bool(OLD_STOCKING_SKU_RE.match(sku or ""))
+
+def stocking_colour(row):
+    """'SILVER' or 'RED': the text colour of the order picks the template; no usable colour -> the stocking's own colour in the SKU."""
+    hexes = re.findall(r"#[0-9a-fA-F]{6}", row.get("FrontColours") or "")
+    if hexes:
+        h = hexes[0]
+        r, g, b = int(h[1:3], 16), int(h[3:5], 16), int(h[5:7], 16)
+        if r > 150 and g < 110 and b < 110:
+            return "RED"
+        if abs(r - g) < 30 and abs(g - b) < 30 and r >= 130:
+            return "SILVER"
+    return "RED" if re.match(r"(?i)^RedStock|^NEWStockings_.*Red$", row.get("SKU") or "") else "SILVER"
+
+def format_stocking_name(raw):
+    """First letter of every word capital, the rest small letters (owner: 'first letter capital and rest should be small letters')."""
+    words = " ".join((raw or "").split()).split(" ")
+    return " ".join(w[:1].upper() + w[1:].lower() for w in words if w)
+
+def _stocking_name(row):
+    import json as _json
+    name = ""
+    try:
+        name = str((_json.loads(row.get("FrontTextJSON") or "{}") or {}).get("Text1") or "").strip()
+    except Exception:
+        name = ""
+    if not name:
+        name = ((row.get("FrontText") or "").strip().splitlines() or [""])[0].strip()
+    return format_stocking_name(name)
+
+def is_stocking_batch_row(row):
+    """A PRINT-choice stocking row that is built in the hourly gang sheets (rhinestone choice, old SKUs and plain stockings are not)."""
+    sku = (row.get("SKU") or "")
+    if not is_stocking_sku(sku) or is_emb_rhine_row(row):
+        return False
+    loc = (row.get("PrintLocation") or "").lower()
+    return not ("plain" in loc or "no personalisation" in loc)
+
+def _plugin_supports_stockings():
+    """The Photoshop plugin must be v3.18 or newer: an older one does not know the stocking job and would save the bare template instead of a sheet.
+    The version is read from the newest 'done' marker (every finished job records the plugin version)."""
+    import json as _json
+    try:
+        from ps_bridge import DONE_DIR
+        newest = max(DONE_DIR.glob("*.json"), key=lambda q: q.stat().st_mtime)
+        ver = str((_json.load(open(newest, encoding="utf-8")) or {}).get("plugin") or "")
+    except Exception:
+        return False
+    m = re.match(r"v(\d+)\.(\d+)", ver)
+    return bool(m) and (int(m.group(1)), int(m.group(2))) >= (3, 18)
+
+def _stocking_build_hour(colour, items, used_rows, hour_start, output_folder=None, now=None):
+    """Build one hour + colour (list of names) into its sheet PSD(s) + same-name text file(s). Returns names placed, -1 on failure."""
+    import json as _json
+    from ps_bridge import submit_job, wait_for_completion, DONE_DIR
+    now      = now or _uk_now_naive()
+    hour_end = hour_start + timedelta(hours=1)
+    name     = f"{hour_start:%Y-%m-%d}_{hour_start:%H%M}-{hour_end:%H%M}_{colour}"          # e.g. 2026-10-16_1100-1200_SILVER
+    out_dir  = os.path.join(output_folder if output_folder else os.path.join(OUTPUT_FOLDER, f"{hour_start:%Y-%m-%d}"), STOCKING_SUBFOLDER)
+    os.makedirs(out_dir, exist_ok=True)
+    stem     = name
+    if any(os.path.exists(os.path.join(out_dir, stem + suf)) for suf in (".psd", ".txt", "_2.psd")):
+        stem = f"{name}_run{now:%H%M}"                                                     # never overwrite an earlier file of that hour
+    job_id   = f"StockingBatch_{colour}_{hour_start:%Y%m%d_%H%M}_{now:%H%M%S}"
+    log(f"Stocking hour {hour_start:%H:%M}-{hour_end:%H:%M} ({hour_start:%Y-%m-%d}) {colour}: {len(items)} name(s) from {len({i['order_id'] for i in items})} order(s)")
+    submit_job(order_id=job_id, template_path=os.path.join(TEMPLATES_FOLDER, STOCKING_TEMPLATES[colour]), zones={}, output_path=os.path.join(out_dir, stem + ".psd"),
+               combined=False, job_type="semi_custom", quantity=1, canvas_h_px=0, items=[],
+               extra={"stocking_sheets": True, "stocking_items": items, "sheet_stem": os.path.join(out_dir, stem).replace("\\", "/"),
+                      "sheet_w_px": STOCKING_SHEET_W_PX, "sheet_h_px": STOCKING_SHEET_H_PX, "slot_cols": STOCKING_COLS, "slot_rows": STOCKING_ROWS,
+                      "slot_pitch_x_px": STOCKING_PITCH_X_PX, "slot_pitch_y_px": STOCKING_PITCH_Y_PX})
+    if not wait_for_completion(job_id, timeout_sec=max(900, 300 + 40 * len(items))):
+        log(f"Stocking hour {name}: Photoshop job failed or timed out - these orders stay pending", "FAIL")
+        return -1
+    try:
+        with open(DONE_DIR / f"{job_id}.json", encoding="utf-8") as fh:
+            sheets = ((_json.load(fh) or {}).get("result") or {}).get("sheets") or []
+    except Exception as e:
+        log(f"Stocking hour {name}: could not read the plugin result: {e}", "FAIL")
+        return -1
+    if not sheets:
+        log(f"Stocking hour {name}: the plugin produced no sheet - these orders stay pending", "FAIL")
+        return -1
+    for s in sheets:                                          # one text file per sheet, same name, order ids only, in slot order (reading order)
+        ids = [b["order_id"] for b in s.get("blocks", [])]
+        txt_path = os.path.splitext(s["path"])[0] + ".txt"
+        with open(txt_path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(ids) + "\n")
+        log(f"Stocking hour {name}: {os.path.basename(s['path'])}  ({len(ids)} name(s)) + {os.path.basename(txt_path)}", "OK")
+    for row in used_rows:
+        mark_processed(row["idCustomOrderDetails"])
+    return len(items)
+
+def run_stocking_batch(order_id_filter=None, reprocess=False, output_folder=None, dry_run=False, date_filter=None, one_window=False):
+    """
+    Build the pending PRINT-choice stocking orders of every FINISHED UK clock hour: one sheet (16 names; more sheets when needed) per hour and colour,
+    e.g. 2026-10-16_1100-1200_SILVER.psd + .txt in Output\\<date>\\Stockings. The current hour waits. Rows are marked processed only after their
+    sheet is saved (never with --no-mark). one_window=True puts everything selected into one window named after the last finished hour (tests).
+    Returns the number of names built, 0 when there was nothing to build, -1 when a build failed (those orders stay pending).
+    """
+    log("=" * 60)
+    log("Stocking hourly batch: collecting pending stocking orders ...")
+    rows = fetch_orders(order_id_filter=order_id_filter, reprocess=reprocess, date_filter=date_filter)
+    now      = _uk_now_naive()
+    now_hour = now.replace(minute=0, second=0, microsecond=0)
+    buckets  = {}                                              # (hour_start, colour) -> ([items], [rows])
+    for row in rows:
+        if not is_stocking_batch_row(row):
+            continue
+        name = _stocking_name(row)
+        if not name:
+            if row["OrderID"] not in _STOCKING_WARNED:
+                _STOCKING_WARNED.add(row["OrderID"])
+                log(f"  Stocking batch: {row['OrderID']} ({row.get('SKU')}) has no name - left pending", "WARN")
+            continue
+        colour = stocking_colour(row)
+        hour   = (now_hour - timedelta(hours=1)) if one_window else _vinyl_order_hour(row["DateAdd"])
+        b = buckets.setdefault((hour, colour), ([], []))
+        for q in range(max(1, int(row.get("Quantity") or 1))):                      # quantity 2 = two stockings with the same name
+            b[0].append({"key": f"{row['OrderID']}|{row['idCustomOrderDetails']}|{q + 1}", "order_id": row["OrderID"], "name": name})
+        b[1].append(row)
+    done_keys = sorted(k for k in buckets if k[0] < now_hour)  # only hours that have finished
+    waiting   = sum(len(buckets[k][0]) for k in buckets if k[0] >= now_hour)
+    if waiting:
+        log(f"Stocking hourly batch: {waiting} name(s) of the current hour ({now_hour:%H:00}-{now_hour + timedelta(hours=1):%H:00}) wait for their hour to finish")
+    if not done_keys:
+        log("Stocking hourly batch: nothing to build.")
+        return 0
+    if dry_run:
+        for (h, c) in done_keys:
+            log(f"  [DRY] {h:%Y-%m-%d} {h:%H:%M}-{h + timedelta(hours=1):%H:%M} {c}: {len(buckets[(h, c)][0])} name(s)", "DRY")
+            for it in buckets[(h, c)][0]:
+                log(f"  [DRY]     {it['order_id']}  {it['name']!r}", "DRY")
+        return 0
+    if not PS_BRIDGE_AVAILABLE or not _ps_alive():
+        log("Stocking hourly batch: Photoshop / ps_bridge not available - nothing built", "FAIL")
+        return -1
+    if not _plugin_supports_stockings():
+        log("Stocking hourly batch: the Photoshop plugin is older than v3.18 (reload it) - nothing built, the names wait", "WARN")
+        return -1
+    for c, rel in STOCKING_TEMPLATES.items():
+        if any(k[1] == c for k in done_keys) and not os.path.isfile(os.path.join(TEMPLATES_FOLDER, rel)):
+            log(f"Stocking hourly batch: template file not found: {os.path.join(TEMPLATES_FOLDER, rel)}", "FAIL")
+            return -1
+    built, failed = 0, False
+    for (h, c) in done_keys:
+        n = _stocking_build_hour(c, buckets[(h, c)][0], buckets[(h, c)][1], h, output_folder=output_folder, now=now)
+        if n < 0:
+            failed = True
+        else:
+            built += n
+    return -1 if failed else built
 
 
 def _build_psd_semi_custom(order_id, rows, out_path):
@@ -4003,7 +4669,10 @@ def build_merged_psd_for_order_group(order_id, rows, out_path, no_bg_remove=Fals
 def get_db():
     return _db_get_connection()
 
-def fetch_orders(limit=None, order_id_filter=None, sku_filter=None, multizone=False, reprocess=False, date_filter=None, date_after=None, font_filter=None, hours=None, with_images=False):
+_SHIPBY_LOGGED = False
+
+def fetch_orders(limit=None, order_id_filter=None, sku_filter=None, multizone=False, reprocess=False, date_filter=None, date_after=None, font_filter=None, hours=None, with_images=False, ship_by_from=None):
+    global _SHIPBY_LOGGED
     conn  = get_db()
     cur   = conn.cursor()
     if reprocess:
@@ -4040,6 +4709,19 @@ def fetch_orders(limit=None, order_id_filter=None, sku_filter=None, multizone=Fa
         where += f" AND CAST(o.DateAdd AS DATE) = '{date_filter}'"
     if date_after:
         where += f" AND o.DateAdd >= '{date_after}'"
+    # Ship-by filter for the LIVE queue: only orders that must ship on / after this date (the new PC takes over from tomorrow's
+    # ship-by orders; the old PC finishes everything before). Set with --ship-by-from or VARSANY_SHIPBY_FROM in .env. Test runs
+    # (--reprocess / --order / --date) are never filtered. Orders without a ship-by date are kept so none is silently dropped.
+    if ship_by_from is None and not (reprocess or order_id_filter or date_filter):
+        ship_by_from = os.environ.get("VARSANY_SHIPBY_FROM", "").strip() or None
+    if ship_by_from:
+        import re as _re
+        if not _re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(ship_by_from)):
+            raise ValueError(f"ship-by filter must look like 2026-10-16, got {ship_by_from!r}")
+        where += f" AND (o.ConvertedShipByDate >= '{ship_by_from}' OR o.ConvertedShipByDate IS NULL)"
+        if not _SHIPBY_LOGGED:
+            _SHIPBY_LOGGED = True
+            log(f"Ship-by filter active: only orders shipping on {ship_by_from} or later are taken (VARSANY_SHIPBY_FROM / --ship-by-from)", "INFO")
     if hours:
         where += f" AND o.DateAdd >= DATEADD(HOUR, -{hours}, GETUTCDATE())"
     if with_images:
@@ -4232,7 +4914,7 @@ def _get_psd_split_paths(base_path):
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 
-def run_batch(limit=None, order_id_filter=None, dry_run=False, sku_filter=None, multizone=False, reprocess=False, date_filter=None, date_after=None, upload_gdrive=False, upload_nas=False, upload_b2=False, no_bg_remove=False, force_bg_remove=False, output_folder=None, font_filter=None, hours=None, with_images=False):
+def run_batch(limit=None, order_id_filter=None, dry_run=False, sku_filter=None, multizone=False, reprocess=False, date_filter=None, date_after=None, upload_gdrive=False, upload_nas=False, upload_b2=False, no_bg_remove=False, force_bg_remove=False, output_folder=None, font_filter=None, hours=None, with_images=False, hold_vinyl=False, ship_by_from=None):
     log("=" * 60)
     log(f"Varsany Batch Processor  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     log(f"Resolution : {DPI} DPI  ({PX_PER_CM:.2f} px/cm)")
@@ -4245,7 +4927,7 @@ def run_batch(limit=None, order_id_filter=None, dry_run=False, sku_filter=None, 
     orders = fetch_orders(limit=limit, order_id_filter=order_id_filter,
                           sku_filter=sku_filter, multizone=multizone, reprocess=reprocess,
                           date_filter=date_filter, date_after=date_after, font_filter=font_filter,
-                          hours=hours, with_images=with_images)
+                          hours=hours, with_images=with_images, ship_by_from=ship_by_from)
     total  = len(orders)
     log(f"Orders to process: {total}")
 
@@ -4293,7 +4975,8 @@ def run_batch(limit=None, order_id_filter=None, dry_run=False, sku_filter=None, 
     # path rejected the order because of the other rows).
     def _row_kind(r):
         _s = (r.get("SKU") or "").strip()
-        return "hoodie" if get_hoodie_design(_s) else ("birthday" if get_birthday_design(_s) else "other")
+        return ("hoodie" if get_hoodie_design(_s) else ("birthday" if get_birthday_design(_s)
+                else ("vinyl" if row_vinyl_group(r) else ("stocking" if is_stocking_batch_row(r) else "other"))))
     order_list = []
     for _oid, _rows in order_groups.items():
         _by_kind = OrderedDict()
@@ -4313,6 +4996,7 @@ def run_batch(limit=None, order_id_filter=None, dry_run=False, sku_filter=None, 
     log(f"Unique orders: {len(order_groups)}  (from {total} rows)")
 
     for i, (order_id, group_rows) in enumerate(order_list, 1):
+        _vinyl_tick()          # daemon only: a new UK clock hour may have started - build the finished vinyl hours first
         first_row   = group_rows[0]
 
         # Date folder: use ConvertedShipByDate, fall back to today if missing
@@ -4329,6 +5013,7 @@ def run_batch(limit=None, order_id_filter=None, dry_run=False, sku_filter=None, 
         sku         = sku_raw.replace("/", "-").replace("\\", "-")
         is_emb_rhine = any(is_emb_rhine_row(r) for r in group_rows)
         is_multi     = any(is_multizone_row(r) for r in group_rows)
+        has_pocket   = any(has_pocket_row(r) for r in group_rows)       # a pocket print anywhere in the order -> Automated folder
         is_kids_hood = any("kidshoo" in (r.get("SKU") or "").lower() or
                            "gymhoodie" in (r.get("SKU") or "").lower() or
                            "kidshood" in (r.get("SKU") or "").lower()
@@ -4423,14 +5108,15 @@ def run_batch(limit=None, order_id_filter=None, dry_run=False, sku_filter=None, 
                     pass  # DB re-check failed — process with original image silently
         # Text-only orders (no image) and rows with Topaz already ready/not-expected fall through to normal processing
 
-        if is_multi:
+        if is_multi or has_pocket:
             folder_type = "Automated"
         elif is_kids_hood:
             folder_type = "DTF Kids Hoodie"
         else:
             folder_type = "DTF Front"
-        # Automated folder has no colour sub-folder; DTF Front and DTF Kids Hoodie do
-        colour_sub = "" if is_multi else sku_colour_folder(sku_raw)
+        # DTF Front, DTF Kids Hoodie and Automated all get black / white sub-folders (owner, 2026-10-16: "like the other black and white
+        # folders"); every other colour saves directly into the category folder. (Automated used to have no colour sub-folder.)
+        colour_sub = sku_colour_folder(sku_raw)
         if colour_sub:
             cat_dir = os.path.join(out_dir, folder_type, colour_sub)
         else:
@@ -4458,11 +5144,28 @@ def run_batch(limit=None, order_id_filter=None, dry_run=False, sku_filter=None, 
         _cat = (first_row.get("CustomizationCategory") or "").strip().lower()
         _is_hoodie     = get_hoodie_design(sku_raw) is not None
         _is_birthday   = get_birthday_design(sku_raw) is not None
-        is_semi_custom = _is_hoodie or _is_birthday or (_cat == "semicustomized" and get_semi_custom_template(sku_raw) is not None)
+        _is_vinyl      = row_vinyl_group(first_row) is not None
+        is_semi_custom = _is_hoodie or _is_birthday or _is_vinyl or (_cat == "semicustomized" and get_semi_custom_template(sku_raw) is not None)
+
+        # Vinyl orders are NOT built one by one in the daily sweep: they stay pending and are packed onto 30 x 80 cm
+        # files by the hourly vinyl build (run_vinyl_batch). Explicit test runs (--order / --reprocess) still build them
+        # singly, unless --hold-vinyl is given: then a test sweep holds them out exactly like the daemon does.
+        if _is_vinyl and VINYL_BATCH_HOLD and (hold_vinyl or (not order_id_filter and not reprocess and not dry_run)):
+            if order_id not in _VINYL_HELD_LOGGED:
+                _VINYL_HELD_LOGGED.add(order_id)
+                log(f"  Holding vinyl order {order_id} for its hourly vinyl file", "INFO")
+            continue
+
+        # Stockings (PRINT choice) are not built one by one either: they wait for their hourly gang sheet (run_stocking_batch).
+        if STOCKING_BATCH_HOLD and is_stocking_batch_row(first_row) and (hold_vinyl or (not order_id_filter and not reprocess and not dry_run)):
+            if order_id not in _STOCKING_HELD_LOGGED:
+                _STOCKING_HELD_LOGGED.add(order_id)
+                log(f"  Holding stocking order {order_id} for its hourly stocking sheet", "INFO")
+            continue
 
         if is_semi_custom:
             # Override output path → Output\<date>\semicustomized\
-            semi_custom_dir = os.path.join(out_dir, "semicustomized")
+            semi_custom_dir = os.path.join(out_dir, VINYL_SUBFOLDER if _is_vinyl else "semicustomized")
             os.makedirs(semi_custom_dir, exist_ok=True)
             safe_id   = order_id.replace("/", "-")
             semi_path = os.path.join(semi_custom_dir, f"{safe_id}.psd")
@@ -4507,6 +5210,8 @@ def run_batch(limit=None, order_id_filter=None, dry_run=False, sku_filter=None, 
                     ok, msg = _build_psd_hoodie(order_id, group_rows, out_path)
                 elif _is_birthday:
                     ok, msg = _build_psd_birthday(order_id, group_rows, out_path)
+                elif _is_vinyl:
+                    ok, msg = _build_psd_vinyl(order_id, group_rows, out_path)
                 else:
                     ok, msg = _build_psd_semi_custom(order_id, group_rows, out_path)
                 if not ok:
@@ -4580,6 +5285,7 @@ if __name__ == "__main__":
     parser.add_argument("--reprocess",   action="store_true",    help="Re-export already-completed orders")
     parser.add_argument("--date",        type=str, default=None, help="Export orders from a specific date e.g. 2026-02-28")
     parser.add_argument("--date-after",  type=str, default=None, help="Export orders placed after a date e.g. 2026-04-10")
+    parser.add_argument("--ship-by-from", type=str, default=None, help="Live queue only: orders whose ship-by date is on or after this date e.g. 2026-10-16 (default: env VARSANY_SHIPBY_FROM)")
     parser.add_argument("--gdrive",        action="store_true",    help="Upload finished PSDs to Google Drive after export")
     parser.add_argument("--nas",           action="store_true",    help="Upload finished PSDs to Synology NAS after export")
     parser.add_argument("--b2",            action="store_true",    help="Upload finished PSDs to Backblaze B2 after export")
@@ -4590,6 +5296,11 @@ if __name__ == "__main__":
     parser.add_argument("--hours",         type=int, default=None, help="Only process orders added in the last N hours e.g. --hours 2")
     parser.add_argument("--with-images",   action="store_true",    help="Only process orders that have a customer image upload")
     parser.add_argument("--no-mark",       action="store_true",    help="Test mode: build the PSDs but never write Topaz_Processed to the database (use with --output)")
+    parser.add_argument("--vinyl-batch",   action="store_true",    help="Build the pending vinyl orders of every finished UK clock hour (one PSD + same-name .txt per hour), then exit (the daemon does this every hour)")
+    parser.add_argument("--vinyl-one-window", action="store_true", help="With --vinyl-batch: put ALL selected orders into one file named after the last finished hour (tests / ad hoc)")
+    parser.add_argument("--stocking-batch", action="store_true", help="Build the pending PRINT-choice stocking orders of every finished UK clock hour (gang sheets per hour and colour), then exit (the daemon does this every hour)")
+    parser.add_argument("--stocking-one-window", action="store_true", help="With --stocking-batch: put ALL selected orders into one window named after the last finished hour (tests / ad hoc)")
+    parser.add_argument("--hold-vinyl",    action="store_true",    help="Test sweeps (--reprocess / --date / --order): hold vinyl orders out of the sweep like the daemon does (they are built hourly by --vinyl-batch instead of one by one)")
     parser.add_argument("--daemon",        action="store_true",    help="Run continuously, polling for new orders every 30 seconds")
     parser.add_argument("--interval",      type=int, default=30,   help="Poll interval in seconds when running as daemon (default: 30)")
     args = parser.parse_args()
@@ -4607,6 +5318,7 @@ if __name__ == "__main__":
         reprocess      = args.reprocess,
         date_filter    = args.date,
         date_after     = args.date_after,
+        ship_by_from   = args.ship_by_from,
         upload_gdrive  = args.gdrive,
         upload_nas     = args.nas,
         upload_b2      = args.b2,
@@ -4616,11 +5328,24 @@ if __name__ == "__main__":
         font_filter    = args.font_filter,
         hours          = args.hours,
         with_images    = args.with_images,
+        hold_vinyl     = args.hold_vinyl,
     )
+
+    if args.stocking_batch:
+        run_stocking_batch(order_id_filter=args.order, reprocess=args.reprocess, output_folder=args.output, dry_run=args.dry_run, date_filter=args.date,
+                           one_window=args.stocking_one_window)
+        raise SystemExit(0)
+
+    if args.vinyl_batch:
+        run_vinyl_batch(order_id_filter=args.order, reprocess=args.reprocess, output_folder=args.output, dry_run=args.dry_run, date_filter=args.date,
+                        one_window=args.vinyl_one_window)
+        raise SystemExit(0)
 
     if args.daemon:
         import time, json as _json
         log(f"Daemon started — polling every {args.interval}s.  Press Ctrl+C to stop.")
+        _VINYL_TICK["enabled"] = True    # the hourly vinyl build (also fired between the orders of a sweep)
+        _VINYL_TICK["output"]  = args.output
         _all_failures     = {}         # order_id → failure record (persists across sweeps all day)
         _last_report_time = 0          # force first write immediately after first sweep
         _REPORT_INTERVAL  = 600        # 10 minutes
@@ -4628,6 +5353,8 @@ if __name__ == "__main__":
         while True:
             try:
                 sweep_fails = run_batch(**batch_kwargs) or []
+                # Vinyl: once per UK clock hour, 24 x 7, build the finished hours (one PSD + text file per hour)
+                _vinyl_tick()
                 _now_str = datetime.now().isoformat(timespec="seconds")
                 for f in sweep_fails:
                     oid = f["order_id"]

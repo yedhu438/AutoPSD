@@ -2,7 +2,7 @@ const {app,core,action,constants} = require("photoshop");
 const uxp = require("uxp");
 const fs  = uxp.storage.localFileSystem;
 
-const PLUGIN_VERSION = "v3.14c-birthday";
+const PLUGIN_VERSION = "v3.18c-docfix";
 const POLL_MS   = 3000;
 const LABEL_PX  = 126;  // 1cm at 320dpi (halved from 2cm)
 const GAP_PX    = 126;  // 1cm gap between zones
@@ -16,6 +16,7 @@ function labelStrip(zoneW){ return Math.max(64, Math.min(LABEL_PX, Math.round(LA
 
 let VARSANY_ROOT=null, DATA_FOLDER=null, JOBS_FOLDER=null, DONE_FOLDER=null, ERROR_FOLDER=null;
 let processing = false;
+let RESULT = null;   // structured result of the current job (the vinyl sheets: where every piece went), written into the done marker
 let TRACE = [];   // layout numbers of the current job; written into the done/error marker so a run can be debugged without screenshots
 function trace(m){ TRACE.push(m); if(TRACE.length > 80) TRACE.shift(); }
 
@@ -277,7 +278,7 @@ async function processZone(doc, zone, data, imgEntry, yOffset, zoneW, zoneH, res
     // width rule: largest size whose widest line is 80% of the zone width (designer rule)
     for(let pass=0;pass<2;pass++){
       const lb=await getLayerBounds();
-      sizePt=Math.min(Math.max(sizePt*(targetPx/(lb.w||1)),20),1200);
+      sizePt=Math.min(Math.max(sizePt*(targetPx/(lb.w||1)),6),1200);   // v3.17b: floor 6pt (was 20pt: a long line on a small canvas, e.g. a 10 cm dog area, ran off both sides)
       await applySize(sizePt);
     }
     // height cap: many lines / blank lines can make the block taller than its share of the area; shrink to fit
@@ -426,8 +427,35 @@ async function closeQuietly(d){
   if(!d) return;
   try{ await d.close(constants.SaveOptions.DONOTSAVECHANGES); }catch(e){}
 }
+function openDocIds(){ const s = new Set(); for(let i = 0; i < app.documents.length; i++) s.add(app.documents[i].id); return s; }
+function docIsOpen(d){ if(!d) return false; for(let i = 0; i < app.documents.length; i++){ if(app.documents[i].id === d.id) return true; } return false; }
 async function selectDocById(d){
+  // Selecting a CLOSED document makes Photoshop raise "The command Select is not currently available" - a dialog that blocks the whole
+  // plugin until someone clicks OK (vinyl hourly test 2026-10-16 14:23). So check first: no dialog, a plain error instead.
+  if(!docIsOpen(d)) throw new Error("select document "+(d ? d.id : "?")+": the document is not open (closed already)");
   await bpc([{_obj:"select",_target:[{_ref:"document",_id:d.id}],_options:{dialogOptions:"dontDisplay"}}], "select document "+d.id);
+}
+// Do NOT trust the document that app.documents.add() returns. With a template (or a leftover document) open it has handed back the OPEN
+// TEMPLATE / the previous document instead of the new blank one (stockings test 13:53 and 14:09, vinyl hourly test 14:23, 2026-10-16): the
+// template then got used as the work canvas and closed. So: remember the open documents, add, and take the document that was NOT open before.
+async function addBlankDoc(opts){
+  const before = openDocIds();
+  const ret = await app.documents.add(opts);
+  let fresh = null;
+  for(let i = 0; i < app.documents.length; i++){ const d = app.documents[i]; if(!before.has(d.id)) fresh = d; }
+  if(!fresh && ret && !before.has(ret.id)) fresh = ret;
+  if(!fresh) throw new Error("documents.add did not create a new document");
+  if(ret && ret.id !== fresh.id) trace("documents.add returned document "+ret.id+" instead of the new document "+fresh.id+" - used the new one");
+  await selectDocById(fresh);
+  return fresh;
+}
+// Blank "Untitled-N" documents are leftovers of a failed job (this Photoshop belongs to the plugin; nobody keeps unsaved work here): close them
+// before the next job, so documents.add / activeDocument can never pick one of them up.
+async function closeStrayDocs(){
+  for(let i = app.documents.length - 1; i >= 0; i--){
+    const d = app.documents[i];
+    if(d && /^Untitled-\d+$/i.test(String(d.name || ""))){ trace("closing a leftover document '"+d.name+"' (id "+d.id+") from an earlier job"); await closeQuietly(d); }
+  }
 }
 function dbg(tag){
   try{ const d = app.activeDocument; trace("[doc] "+tag+": open="+app.documents.length+" active='"+d.name+"' id="+d.id+" "+d.width+"x"+d.height); }
@@ -683,13 +711,352 @@ async function applyBirthdayCopy(doc, item, job, groupName){
   await bp([{_obj:"set",null:{_ref:[{_enum:"ordinal",_value:"targetEnum",_ref:"layer"}]},to:{_obj:"layer",name:groupName}}]);
 }
 
+// ── Vinyl name templates (template\vynil template.psd) ───────────────────────────────────────────────────────────────
+// One hidden GROUP per product holds its live text layers (name / initials / number, with bevel, stroke and glow effects).
+// The job copies that whole group into a NEW document, edits ONLY the text (the template's own colours stay), keeps the
+// template's text size (shrunk only to the "Max ..cm" written in the layer name), keeps every layer's alignment, stacks
+// copies 1 cm apart and trims the canvas to the artwork (no margin).
+function vinylTextLayers(layers, out){
+  for(const l of layers){
+    if(l.kind === "text") out.push(l);
+    else if(l.kind === "group" && l.layers) vinylTextLayers(l.layers, out);
+  }
+  return out;
+}
+// Effective text size = font size x the layer's own scale factor (read from the layer descriptor).
+async function textMetrics(layerId){
+  try{
+    const r = await bp([{_obj:"get",_target:[{_ref:"layer",_id:layerId}],_options:{dialogOptions:"dontDisplay"}}]);
+    const tk = r[0] && r[0].textKey;
+    let xx = null, size = null;
+    try{ xx = tk.textShape[0].transform.xx; }catch(e){}
+    try{ size = tk.textStyleRange[0].textStyle.size._value; }catch(e){}
+    return {xx:xx, size:size, eff:(xx && size) ? xx*size : null};
+  }catch(e){ return {xx:null, size:null, eff:null}; }
+}
+// "Max 20cm Width" / "Max 15CM Height" / "2x Name - Light Blue - Max 12CM" (two names, each at most 12 cm) in a layer name.
+function parseVinylMax(name){
+  const m = /max\s*(\d+(?:\.\d+)?)\s*cm(?:\s*(width|height))?/i.exec(name || "");
+  if(!m) return null;
+  const n = /^\s*(\d+)\s*x\b/i.exec(name || "");
+  return {cm:parseFloat(m[1]), dim:(m[2] || "width").toLowerCase(), copies:n ? parseInt(n[1], 10) : 1};
+}
+// Replace the text of one template layer, give it back the template's size, honour its "Max" limit and keep its alignment.
+async function applyVinylText(l, value, tplW){
+  const PXCM = 125.984;
+  const id = l.id, lname = String(l.name || ""), placeholder = String(l.textItem.contents || "");
+  const multiLine = /[\r\n]/.test(placeholder);
+  let just = "center"; try{ just = String(l.textItem.paragraphStyle.justification || "center").toLowerCase(); }catch(e){}
+  const sel = async () => { await bp([{_obj:"select",_target:[{_ref:"layer",_id:id}],makeVisible:false}]); };
+  await sel();
+  const b0 = await getLayerBounds(), m0 = await textMetrics(id);
+  l.textItem.contents = value;
+  await sel();
+  let b = await getLayerBounds();
+  const m1 = await textMetrics(id);
+  let s = 1;
+  if(m0.eff && m1.eff) s = m0.eff / m1.eff;                          // replacing the text drops the layer's scale factor
+  else if(!multiLine && !/[\r\n]/.test(value) && b0.h > 0 && b.h > 0 && b.h < b0.h*0.7) s = b0.h / b.h;   // fallback: glyph heights
+  const lim = parseVinylMax(lname);
+  let limTxt = "";
+  if(lim){
+    const dimPx = (lim.dim === "height" ? b.h : b.w) * s;
+    const limPx = lim.dim === "height" ? lim.cm*PXCM : (lim.cm*lim.copies + (lim.copies > 1 ? 0.6 : 0))*PXCM;
+    if(dimPx > limPx){ s *= limPx/dimPx; limTxt = " (shrunk to Max "+lim.cm+"cm "+lim.dim+")"; }
+  }
+  const wF = b.w * s; if(wF > tplW - 40) s *= (tplW - 40)/wF;           // never wider than the canvas
+  if(Math.abs(s - 1) > 0.01){
+    await bp([{_obj:"transform",null:{_ref:[{_ref:"layer",_enum:"ordinal",_value:"targetEnum"}]},
+      freeTransformCenterState:{_enum:"quadCenterState",_value:"QCSAverage"},
+      width:{_unit:"percentUnit",_value:s*100},height:{_unit:"percentUnit",_value:s*100},
+      constrainProportions:true,interfaceIconFrameDimmed:{_enum:"interpolationType",_value:"bicubicAutomatic"}}]);
+  }
+  const b1 = await getLayerBounds();
+  let dx = 0;
+  if(just === "left") dx = b0.left - b1.left; else if(just === "right") dx = b0.right - b1.right;
+  else dx = (b0.left + b0.right)/2 - (b1.left + b1.right)/2;
+  const dy = multiLine ? (b0.top - b1.top) : ((b0.top + b0.bottom)/2 - (b1.top + b1.bottom)/2);
+  await moveLayerBy(Math.round(dx), Math.round(dy));
+  trace("vinyl '"+lname+"': '"+placeholder.replace(/[\r\n]+/g,"/")+"' -> '"+String(value).replace(/[\r\n]+/g,"/")+"'  size eff "+(m0.eff ? m0.eff.toFixed(1) : "?")+" -> "+(m1.eff ? m1.eff.toFixed(1) : "?")+
+        ", scale "+s.toFixed(2)+limTxt+", "+just+", box "+Math.round(b1.w)+"x"+Math.round(b1.h)+" (template "+Math.round(b0.w)+"x"+Math.round(b0.h)+")");
+}
+
+// Edit the text of a copied template group in the ACTIVE document: numeric placeholder = number (text2), anything else =
+// name / initials (text1); an empty value, or a layer that is not the variant for this order, is removed.
+// p = {text1, text2, keep_layer}. Returns the text layers that are left.
+async function vinylEditGroup(grp, p, tplW){
+  for(const l of vinylTextLayers(grp.layers, [])){
+    const ph = String(l.textItem.contents || "").trim(), lname = String(l.name || "");
+    const isNum = /^\d+$/.test(ph);
+    if(p.keep_layer && !lname.toLowerCase().includes(String(p.keep_layer).toLowerCase())){
+      trace("vinyl '"+lname+"': not the variant for this order (keeping '"+p.keep_layer+"') - removed"); l.delete(); continue;
+    }
+    let val = isNum ? (p.text2 || "") : (p.text1 || "");
+    if(!val){ trace("vinyl '"+lname+"': nothing to print for this layer - removed"); l.delete(); continue; }
+    if(!isNum){
+      const mult = /^\s*(\d+)\s*x\b/i.exec(lname);
+      if(mult) val = Array(parseInt(mult[1], 10)).fill(val).join(" ");                // "2x Name": one name per boot
+      else if(/[\r\n]/.test(String(l.textItem.contents || ""))) val = Array.from(val).join("\r");   // vertical sock text
+    }
+    await applyVinylText(l, val, tplW);
+  }
+  return vinylTextLayers(grp.layers, []);
+}
+
+// ── Vinyl MORNING SHEETS: every pending vinyl order packed onto 30 x 80 cm canvases ───────────────────────────────
+// Phase A measures every piece (the edited group, one copy) in a work canvas; phase B packs the pieces onto sheets
+// (shelf packing, tallest first); phase C builds each sheet and saves it. A piece = one order line with all its copies.
+const VINYL_EP = 40;      // room around a piece for the stroke / glow
+async function vinylPlaceItem(tplDoc, grpT, targetDoc, item, tplW, destX, destY, copies, gap){
+  const known = new Set(targetDoc.layers.map(l => l.id));
+  await selectDocById(tplDoc);
+  await bp([{_obj:"select",_target:[{_ref:"layer",_id:grpT.id}],makeVisible:false}]);
+  await bpc([{_obj:"duplicate",_target:[{_ref:"layer",_enum:"ordinal",_value:"targetEnum"}],to:{_ref:"document",_id:targetDoc.id},version:5}], "copy vinyl group");
+  await selectDocById(targetDoc);
+  const grp = targetDoc.layers.find(l => !known.has(l.id));
+  if(!grp) throw new Error("copied vinyl group not found ("+item.group+")");
+  grp.visible = true;
+  const left = await vinylEditGroup(grp, item, tplW);
+  if(!left.length) throw new Error("no text left to print in '"+item.group+"' ("+item.order_id+")");
+  const ub = unionBox(left.map(layerBox));
+  const hb = (ub.bottom - ub.top) + 2*VINYL_EP, wb = (ub.right - ub.left) + 2*VINYL_EP;
+  await bp([{_obj:"select",_target:[{_ref:"layer",_id:grp.id}],makeVisible:false}]);
+  await moveLayerBy(Math.round(destX + VINYL_EP - ub.left), Math.round(destY + VINYL_EP - ub.top));
+  for(let k = 1; k < copies; k++){
+    await bpc([{_obj:"duplicate",_target:[{_ref:"layer",_enum:"ordinal",_value:"targetEnum"}],version:5}], "duplicate piece (copy "+(k+1)+")");
+    await moveLayerBy(0, Math.round(hb + gap));
+  }
+  return {grp:grp, wb:wb, hb:hb};
+}
+// MaxRects packing (best short side fit): free rectangles are kept per sheet, every piece goes into the free rectangle it
+// fits tightest, and the free space is split around it. Several orderings are tried and the best result is kept: fewest
+// sheets, then the least used height. Each piece is packed with its 1 cm gap (G) added, inside a usable area enlarged by G,
+// so neighbouring pieces end up exactly G apart and the outer margin M stays free. No rotation (the text must read upright).
+function vinylMaxRects(order, blocks, SW, SH, M, G){
+  const UW = SW - 2*M + G, UH = SH - 2*M + G;
+  const sheets = [];
+  const newSheet = () => { const s = {free:[{x:0, y:0, w:UW, h:UH}], placed:[]}; sheets.push(s); return s; };
+  const fit = (s, w, h) => {
+    let best = null;
+    for(const r of s.free){
+      if(w <= r.w && h <= r.h){
+        const lw = r.w - w, lh = r.h - h, sh = Math.min(lw, lh), lg = Math.max(lw, lh);
+        if(!best || sh < best.sh || (sh === best.sh && lg < best.lg)) best = {r:r, sh:sh, lg:lg};
+      }
+    }
+    return best;
+  };
+  const place = (s, x, y, w, h) => {
+    const nf = [];
+    for(const f of s.free){
+      if(x >= f.x + f.w || x + w <= f.x || y >= f.y + f.h || y + h <= f.y){ nf.push(f); continue; }
+      if(x > f.x) nf.push({x:f.x, y:f.y, w:x - f.x, h:f.h});
+      if(x + w < f.x + f.w) nf.push({x:x + w, y:f.y, w:f.x + f.w - (x + w), h:f.h});
+      if(y > f.y) nf.push({x:f.x, y:f.y, w:f.w, h:y - f.y});
+      if(y + h < f.y + f.h) nf.push({x:f.x, y:y + h, w:f.w, h:f.y + f.h - (y + h)});
+    }
+    s.free = nf.filter((a, i) => !nf.some((b, j) => j !== i && a.x >= b.x && a.y >= b.y && a.x + a.w <= b.x + b.w && a.y + a.h <= b.y + b.h
+      && !(a.x === b.x && a.y === b.y && a.w === b.w && a.h === b.h && j > i)));
+  };
+  for(const i of order){
+    const b = blocks[i];
+    if(b.w > SW - 2*M) throw new Error("vinyl piece "+b.order_id+" is "+b.w+" px wide - wider than a sheet");
+    if(b.h > SH - 2*M) throw new Error("vinyl piece "+b.order_id+" is "+b.h+" px tall - taller than a sheet");
+    const w = b.w + G, h = b.h + G;
+    let s = null, f = null;
+    for(const cand of sheets){ f = fit(cand, w, h); if(f){ s = cand; break; } }
+    if(!s){ s = newSheet(); f = fit(s, w, h); }
+    s.placed.push({b:b, x:f.r.x + M, y:f.r.y + M});
+    place(s, f.r.x, f.r.y, w, h);
+  }
+  return sheets;
+}
+function vinylPack(blocks, SW, SH, M, G){
+  const idx = blocks.map((b, i) => i);
+  const orders = [
+    idx.slice().sort((a, b) => (blocks[b].w*blocks[b].h) - (blocks[a].w*blocks[a].h)),                         // area, biggest first
+    idx.slice().sort((a, b) => (blocks[b].h - blocks[a].h) || (blocks[b].w - blocks[a].w)),                    // tallest first
+    idx.slice().sort((a, b) => (blocks[b].w - blocks[a].w) || (blocks[b].h - blocks[a].h)),                    // widest first
+    idx.slice().sort((a, b) => Math.max(blocks[b].w, blocks[b].h) - Math.max(blocks[a].w, blocks[a].h)),       // longest side first
+  ];
+  let best = null, bestScore = null;
+  for(const o of orders){
+    const sheets = vinylMaxRects(o, blocks, SW, SH, M, G);
+    let usedH = 0; for(const s of sheets) usedH += Math.max(...s.placed.map(p => p.y + p.b.h));
+    const score = sheets.length*1e9 + usedH;
+    if(bestScore === null || score < bestScore){ best = sheets; bestScore = score; }
+  }
+  return best;
+}
+async function runVinylSheets(job, tplDoc, tplW){
+  const SW = job.sheet_w_px || 3780, SH = job.sheet_h_px || 10079, M = 0, G = 126, PXCM = 125.984;   // M = 0: every sheet is trimmed to the artwork anyway
+  const items = job.vinyl_items || [];
+  if(!items.length) throw new Error("vinyl sheets: no items");
+  const mk = async (name) => addBlankDoc({width:SW, height:SH, resolution:job.dpi || 320, mode:constants.NewDocumentMode.CMYK,
+    fill:constants.DocumentFill.TRANSPARENT, depth:8, profile:"U.S. Web Coated (SWOP) v2"});
+  const groupT = {};
+  for(const g of new Set(items.map(i => i.group))){
+    const t = tplDoc.layers.find(l => l.kind === "group" && l.name === g);
+    if(!t) throw new Error("Vinyl template has no group '"+g+"'");
+    groupT[g] = t;
+  }
+  // Phase A: measure one copy of every order line
+  let bench = null;
+  const blocks = [];
+  try{
+    bench = await mk("bench");
+    for(const it of items){
+      const m = await vinylPlaceItem(tplDoc, groupT[it.group], bench, it, tplW, 0, 0, 1, G);
+      m.grp.delete();
+      const maxCopies = Math.max(1, Math.floor((SH - 2*M + G) / (m.hb + G)));
+      let left = Math.max(1, Math.round(it.copies || 1));
+      while(left > 0){
+        const c = Math.min(left, maxCopies); left -= c;
+        blocks.push({item:it, order_id:it.order_id, key:it.key, copies:c, hb:m.hb, w:Math.ceil(m.wb), h:Math.ceil(c*m.hb + (c - 1)*G)});
+      }
+    }
+  } finally { await closeQuietly(bench); }
+  trace("vinyl sheets: measured "+items.length+" order line(s) -> "+blocks.length+" piece(s)");
+  // Phase B: pack
+  const sheets = vinylPack(blocks, SW, SH, M, G);
+  trace("vinyl sheets: packed onto "+sheets.length+" sheet(s) of "+SW+"x"+SH+" px");
+  // Phase C: build and save every sheet
+  const out = [];
+  for(let si = 0; si < sheets.length; si++){
+    const n = si + 1, s = sheets[si];
+    let sd = null;
+    try{
+      sd = await mk("sheet"+n);
+      const placed = [];
+      for(const pl of s.placed){
+        await vinylPlaceItem(tplDoc, groupT[pl.b.item.group], sd, pl.b.item, tplW, pl.x, pl.y, pl.b.copies, G);
+        placed.push({key:pl.b.key, order_id:pl.b.order_id, copies:pl.b.copies, x_cm:pl.x/PXCM, y_cm:pl.y/PXCM, w_cm:pl.b.w/PXCM, h_cm:pl.b.h/PXCM});
+      }
+      // file name: the hour window (sheet_stem) - the first sheet as is, a second one gets _2, a third _3 ...
+      const path = job.sheet_stem ? (String(job.sheet_stem) + (n === 1 ? "" : "_" + n) + ".psd")
+                                  : String(job.sheet_pattern).replace("{n}", String(n));
+      const entry = await getOutputEntry(path);
+      await selectDocById(sd);
+      // crop the sheet to the artwork: no empty space (the 1 cm gaps between pieces are inside the artwork box)
+      await bpc([{_obj:"trim",trimBasedOn:{_enum:"trimBasedOn",_value:"transparency"},top:true,bottom:true,left:true,right:true}], "trim the sheet to the artwork");
+      const fin = await getDocSize();
+      trace("vinyl sheet "+n+" trimmed to "+fin.w+"x"+fin.h+"px ("+(fin.w/PXCM).toFixed(1)+" x "+(fin.h/PXCM).toFixed(1)+" cm)");
+      await bp([{_obj:"save",null:{_ref:[{_enum:"ordinal",_value:"targetEnum",_ref:"document"}]},
+        in:{_path:fs.createSessionToken(entry),_kind:"local"},as:{_obj:"photoshop35Format",embedProfiles:true}}]);
+      log("Saved vinyl sheet "+n+"/"+sheets.length+": "+entry.name+" ("+placed.length+" pieces)");
+      out.push({n:n, path:path, w_px:fin.w, h_px:fin.h, blocks:placed});
+      await sd.close(constants.SaveOptions.DONOTSAVECHANGES); sd = null;
+    } finally { await closeQuietly(sd); }
+    await purgeCaches();
+  }
+  RESULT = {sheets:out, sheet_w_px:SW, sheet_h_px:SH};
+}
+
+// ── Stockings gang sheets (template\Stockings\Stockings DTF SILVER | RED Template.psd) ─────────────────────────────────
+// The template holds ONE group: a live name text layer ("Aiden", KaushanScript, with its own effects) plus a foil texture smart
+// object clipped to it. Per UK hour and colour the names are ganged on one or more sheets: the group is copied once per name into a
+// new document, the name is replaced (font, effects and size of the template stay; the name is shrunk only to fit the template's own
+// name box, never enlarged), the copy is moved into its grid slot (reading order: left to right, top to bottom) and every sheet is
+// trimmed to the artwork. Everything stays live text.
+async function applyStockingText(l, value){
+  const id = l.id;
+  const sel = async () => { await bp([{_obj:"select",_target:[{_ref:"layer",_id:id}],makeVisible:false}]); };
+  await sel();
+  const b0 = await getLayerBounds(), m0 = await textMetrics(id);
+  l.textItem.contents = value;
+  await sel();
+  const b = await getLayerBounds();
+  const m1 = await textMetrics(id);
+  let s = 1;
+  if(m0.eff && m1.eff) s = m0.eff / m1.eff;                              // replacing the text drops the layer's scale factor
+  else if(b0.h > 0 && b.h > 0 && b.h < b0.h*0.7) s = b0.h / b.h;         // fallback: glyph heights
+  const fit = Math.min(1, b0.w/((b.w*s) || 1), b0.h/((b.h*s) || 1));    // shrink only, to the template's own name box
+  s *= fit;
+  if(Math.abs(s - 1) > 0.01){
+    await bp([{_obj:"transform",null:{_ref:[{_ref:"layer",_enum:"ordinal",_value:"targetEnum"}]},
+      freeTransformCenterState:{_enum:"quadCenterState",_value:"QCSAverage"},
+      width:{_unit:"percentUnit",_value:s*100},height:{_unit:"percentUnit",_value:s*100},
+      constrainProportions:true,interfaceIconFrameDimmed:{_enum:"interpolationType",_value:"bicubicAutomatic"}}]);
+  }
+  const b1 = await getLayerBounds();
+  await moveLayerBy(Math.round((b0.left + b0.right)/2 - (b1.left + b1.right)/2), Math.round((b0.top + b0.bottom)/2 - (b1.top + b1.bottom)/2));
+  trace("stocking '"+value+"': size eff "+(m0.eff ? m0.eff.toFixed(1) : "?")+" -> "+(m1.eff ? m1.eff.toFixed(1) : "?")+", scale "+s.toFixed(2)+(fit < 1 ? " (shrunk to the name box)" : "")+
+        ", box "+Math.round(b1.w)+"x"+Math.round(b1.h)+" (template "+Math.round(b0.w)+"x"+Math.round(b0.h)+")");
+}
+async function runStockingSheets(job, tplDoc, tplW){
+  const SW = job.sheet_w_px || 3543, SH = job.sheet_h_px || 5906, PXCM = 125.984;
+  const items = job.stocking_items || [];
+  if(!items.length) throw new Error("stocking sheets: no names");
+  const cols = job.slot_cols || 2, rows = job.slot_rows || 8, px = job.slot_pitch_x_px || 1741, py = job.slot_pitch_y_px || 718, cap = cols*rows;
+  const grpT = tplDoc.layers.find(l => l.kind === "group");
+  if(!grpT) throw new Error("Stockings template has no layer group");
+  if(!vinylTextLayers(grpT.layers, []).length) throw new Error("Stockings template group has no text layer");
+  const out = [], nSheets = Math.ceil(items.length / cap);
+  for(let si = 0; si < nSheets; si++){
+    const n = si + 1, chunk = items.slice(si*cap, (si + 1)*cap);
+    let sd = null;
+    const openBefore = new Set(); for(let di = 0; di < app.documents.length; di++) openBefore.add(app.documents[di].id);
+    try{
+      // app.documents.add() has returned the TEMPLATE document instead of the new blank one (v3.18a test: the names were built inside the
+      // template and closing the "sheet" closed the template): addBlankDoc() takes the document that was not open before.
+      sd = await addBlankDoc({width:SW, height:SH, resolution:job.dpi || 320, mode:constants.NewDocumentMode.CMYK,
+        fill:constants.DocumentFill.TRANSPARENT, depth:8, profile:"U.S. Web Coated (SWOP) v2"});
+      if(sd.id === tplDoc.id) throw new Error("stocking sheet "+n+": the sheet document is the template document - nothing was built");
+      const startIds = new Set(sd.layers.map(l => l.id)), placedIds = new Set();
+      trace("stocking sheet "+n+": sheet document id "+sd.id+" (template id "+tplDoc.id+"), starts with layers: "+(sd.layers.map(l => l.name+"#"+l.id).join(", ") || "none"));
+      const placed = [];
+      for(let k = 0; k < chunk.length; k++){
+        const it = chunk[k], col = k % cols, row = Math.floor(k / cols);
+        const known = new Set(sd.layers.map(l => l.id));
+        await selectDocById(tplDoc);
+        await bp([{_obj:"select",_target:[{_ref:"layer",_id:grpT.id}],makeVisible:false}]);
+        await bpc([{_obj:"duplicate",_target:[{_ref:"layer",_enum:"ordinal",_value:"targetEnum"}],to:{_ref:"document",_id:sd.id},version:5}], "copy stocking group");
+        await selectDocById(sd);
+        const grp = sd.layers.find(l => !known.has(l.id));
+        if(!grp) throw new Error("copied stocking group not found ("+it.order_id+")");
+        grp.visible = true;
+        placedIds.add(grp.id);
+        try{ grp.name = "Stocking_"+(k + 1)+"_"+it.name; }catch(re){ trace("stocking: could not rename the group: "+re.message); }
+        await applyStockingText(vinylTextLayers(grp.layers, [])[0], it.name);
+        await bp([{_obj:"select",_target:[{_ref:"layer",_id:grp.id}],makeVisible:false}]);
+        await moveLayerBy(col*px, row*py);
+        placed.push({key:it.key, order_id:it.order_id, name:it.name, slot:k + 1});
+      }
+      // Nothing but the copied name groups may be in the sheet (a stray template group once printed "Aiden" under the first name).
+      const stray = sd.layers.filter(l => !startIds.has(l.id) && !placedIds.has(l.id));
+      if(stray.length || sd.layers.length !== startIds.size + chunk.length)
+        throw new Error("stocking sheet "+n+": unexpected layers ("+sd.layers.map(l => l.name+"#"+l.id).join(", ")+") - expected "+chunk.length+" name group(s)");
+      const path = job.sheet_stem ? (String(job.sheet_stem) + (n === 1 ? "" : "_" + n) + ".psd")
+                                  : String(job.sheet_pattern).replace("{n}", String(n));
+      const entry = await getOutputEntry(path);
+      await selectDocById(sd);
+      await bpc([{_obj:"trim",trimBasedOn:{_enum:"trimBasedOn",_value:"transparency"},top:true,bottom:true,left:true,right:true}], "trim the stocking sheet to the artwork");
+      const fin = await getDocSize();
+      trace("stocking sheet "+n+" ("+chunk.length+" names) trimmed to "+fin.w+"x"+fin.h+"px ("+(fin.w/PXCM).toFixed(1)+" x "+(fin.h/PXCM).toFixed(1)+" cm)");
+      await bp([{_obj:"save",null:{_ref:[{_enum:"ordinal",_value:"targetEnum",_ref:"document"}]},
+        in:{_path:fs.createSessionToken(entry),_kind:"local"},as:{_obj:"photoshop35Format",embedProfiles:true}}]);
+      log("Saved stocking sheet "+n+"/"+nSheets+": "+entry.name+" ("+placed.length+" names)");
+      out.push({n:n, path:path, w_px:fin.w, h_px:fin.h, blocks:placed});
+      await sd.close(constants.SaveOptions.DONOTSAVECHANGES); sd = null;
+    } finally {
+      await closeQuietly(sd);
+      for(let di = app.documents.length - 1; di >= 0; di--){                      // never leave a stray document open in the live Photoshop
+        const d = app.documents[di];
+        if(d && !openBefore.has(d.id)){ trace("stocking sheet "+n+": closing a leftover document '"+d.name+"' (id "+d.id+")"); await closeQuietly(d); }
+      }
+    }
+    await purgeCaches();
+  }
+  RESULT = {sheets:out, sheet_w_px:SW, sheet_h_px:SH};
+}
+
 // ── Main job processor ────────────────────────────────────────────────────────
 async function processJob(jobEntry){
   let job, orderId=jobEntry.name.replace(".json","");
   try{job=await readJSON(jobEntry);orderId=job.order_id||orderId;}
   catch(e){await writeJSON(ERROR_FOLDER,jobEntry.name,{order_id:orderId,error:"Parse: "+e.message,failed_at:ts()});await jobEntry.delete();return;}
   log("Processing: "+orderId);
-  TRACE = [];
+  TRACE = []; RESULT = null;
 
   const isCombined = job.combined === true;
   let tplEntry, imgEntries={}, outEntry;
@@ -724,6 +1091,7 @@ async function processJob(jobEntry){
   await core.executeAsModal(async()=>{
     let doc=null;
     try{
+      await closeStrayDocs();      // blank leftovers of an earlier failed job must not be picked up as "the active document"
       if(tplEntry){
         // Semi-custom: real template file with pre-built named layers (jersey crest, "Player"/"08" text).
         const tplToken=fs.createSessionToken(tplEntry);
@@ -733,7 +1101,7 @@ async function processJob(jobEntry){
       } else {
         // Standard: blank canvas created from scratch at the exact product/zone size —
         // no template file to keep in sync, no "No template found" failure mode.
-        doc = await app.documents.add({
+        doc = await addBlankDoc({
           width:      job.canvas_w_px  || 3780,
           height:     job.canvas_h_px  || 3780,
           resolution: job.dpi || 320,
@@ -766,7 +1134,87 @@ async function processJob(jobEntry){
           }
         }
 
-        if(job.hoodie || job.birthday){
+        if(job.vinyl_sheets){
+          // ── Vinyl morning sheets: all pending vinyl orders on 30 x 80 cm canvases ───────────────────────────────────
+          try{ await runVinylSheets(job, doc, docW); success = true; }
+          finally { /* the template is closed below in every case */ }
+          try{ await doc.close(constants.SaveOptions.DONOTSAVECHANGES); }catch(ce){ log("Close warning (non-fatal): "+ce.message, true); }
+          doc = null;
+          await purgeCaches();
+
+        } else if(job.stocking_sheets){
+          // ── Stockings: the names of one UK hour and colour ganged on 28 x 47 cm sheets ───────────────────────────────
+          try{ await runStockingSheets(job, doc, docW); success = true; }
+          finally { /* the template is closed below in every case */ }
+          try{ await doc.close(constants.SaveOptions.DONOTSAVECHANGES); }catch(ce){ log("Close warning (non-fatal): "+ce.message, true); }
+          doc = null;
+          await purgeCaches();
+
+        } else if(job.vinyl){
+          // ── Vinyl names: copy the product's group into a new canvas, edit the text only, stack copies, trim ──────────
+          const tplDoc = doc, tplW = docW, copies = Math.max(1, Math.round(job.copies || 1)), HGAP = 126, PAD = 120;
+          let newDoc = null;
+          try{
+            const grpT = tplDoc.layers.find(l => l.kind === "group" && l.name === job.group);
+            if(!grpT) throw new Error("Vinyl template has no group '"+job.group+"'");
+            const textsT = vinylTextLayers(grpT.layers, []);
+            if(!textsT.length) throw new Error("Vinyl group '"+job.group+"' has no text layers");
+            const ubT = unionBox(textsT.map(layerBox));
+            let docH2 = Math.ceil(ubT.bottom + 400 + (copies - 1)*((ubT.bottom - ubT.top)*1.5 + HGAP + PAD));
+            if(docH2 > 29500) throw new Error("vinyl: "+copies+" copies of '"+job.group+"' need "+docH2+" px (limit 30000)");
+            newDoc = await addBlankDoc({width:tplW, height:docH2, resolution:job.dpi || 320, mode:constants.NewDocumentMode.CMYK,
+              fill:constants.DocumentFill.TRANSPARENT, depth:8, profile:"U.S. Web Coated (SWOP) v2"});
+            log("Vinyl canvas "+tplW+"x"+docH2+"px for group '"+job.group+"', "+copies+" cop"+(copies > 1 ? "ies" : "y"));
+            // copy the whole group (live text + effects) from the template into the new canvas
+            await selectDocById(tplDoc);
+            await bp([{_obj:"select",_target:[{_ref:"layer",_id:grpT.id}],makeVisible:false}]);
+            await bpc([{_obj:"duplicate",_target:[{_ref:"layer",_enum:"ordinal",_value:"targetEnum"}],to:{_ref:"document",_id:newDoc.id},version:5}], "copy group to the new canvas");
+            await selectDocById(newDoc);
+            const grp = newDoc.layers.find(l => l.kind === "group" && l.name === job.group);
+            if(!grp) throw new Error("copied vinyl group not found in the new canvas");
+            grp.visible = true;                                           // the template groups are hidden
+            const left = await vinylEditGroup(grp, job, tplW);
+            if(!left.length) throw new Error("vinyl: no text left to print in group '"+job.group+"'");
+            // stack the copies (1 cm apart), making the canvas taller first if the edited text needs it
+            let ubE = unionBox(left.map(layerBox));
+            // A longer name grows to BOTH sides of its centre and used to run past the canvas edge (and was clipped).
+            // Move the whole group so everything lies inside the canvas, with room for the glow / stroke.
+            const EDGE = 80;
+            const sx = ubE.left < EDGE ? Math.round(EDGE - ubE.left) : 0, sy = ubE.top < EDGE ? Math.round(EDGE - ubE.top) : 0;
+            await bp([{_obj:"select",_target:[{_ref:"layer",_id:grp.id}],makeVisible:false}]);
+            if(sx || sy){
+              await moveLayerBy(sx, sy);
+              ubE = {left:ubE.left + sx, right:ubE.right + sx, top:ubE.top + sy, bottom:ubE.bottom + sy};
+              trace("vinyl: group moved by "+sx+","+sy+" px to lie inside the canvas");
+            }
+            const dyCopy = Math.ceil((ubE.bottom - ubE.top) + HGAP + PAD);
+            const need = Math.ceil(ubE.bottom + 300 + (copies - 1)*dyCopy);
+            const needW = Math.max(tplW, Math.ceil(ubE.right + EDGE));
+            if(need > 29500) throw new Error("vinyl: "+copies+" copies need "+need+" px (limit 30000)");
+            if(need > docH2 || needW > tplW) await newDoc.resizeCanvas(needW, Math.max(need, docH2), constants.AnchorPosition.TOPLEFT);
+            for(let k = 1; k < copies; k++){
+              await bpc([{_obj:"duplicate",_target:[{_ref:"layer",_enum:"ordinal",_value:"targetEnum"}],version:5}], "duplicate group (copy "+(k+1)+")");
+              await moveLayerBy(0, dyCopy);
+            }
+            // trim the canvas to the artwork: no empty space (effects such as the glow are part of the artwork)
+            await selectDocById(newDoc);
+            await bpc([{_obj:"trim",trimBasedOn:{_enum:"trimBasedOn",_value:"transparency"},top:true,bottom:true,left:true,right:true}], "trim to the artwork");
+            const fin = await getDocSize();
+            trace("vinyl canvas trimmed to "+fin.w+"x"+fin.h+"px ("+(fin.w/125.984).toFixed(1)+" x "+(fin.h/125.984).toFixed(1)+" cm)");
+            const outToken = fs.createSessionToken(outEntry);
+            log("Saving vinyl: "+outEntry.nativePath);
+            await bp([{_obj:"save",null:{_ref:[{_enum:"ordinal",_value:"targetEnum",_ref:"document"}]},
+              in:{_path:outToken,_kind:"local"},as:{_obj:"photoshop35Format",embedProfiles:true}}]);
+            log("Saved: "+outEntry.name);
+            success = true;
+            try{ await newDoc.close(constants.SaveOptions.DONOTSAVECHANGES); }catch(ce){ log("Close warning (non-fatal): "+ce.message, true); }
+            newDoc = null;
+          }catch(ve){ await closeQuietly(newDoc); throw ve; }
+          try{ await doc.close(constants.SaveOptions.DONOTSAVECHANGES); }catch(ce){ log("Close warning (non-fatal): "+ce.message, true); }
+          doc = null;
+          await purgeCaches();
+
+        } else if(job.hoodie || job.birthday){
           // ── Football / gymnastic hoodie: write each name into the template, stack copies 1 cm apart ──────
           const fitW = job.fit_w_px || 2268, fitH = job.fit_h_px || 693, cropW = job.crop_w_px || 2520;
           const HGAP = 126;
@@ -1199,7 +1647,7 @@ async function processJob(jobEntry){
   },{commandName:"Process "+orderId});
 
   if(success){
-    await writeJSON(DONE_FOLDER,jobEntry.name,{order_id:orderId,output_filename:outEntry.name,completed_at:ts(),plugin:PLUGIN_VERSION,trace:TRACE});
+    await writeJSON(DONE_FOLDER,jobEntry.name,{order_id:orderId,output_filename:outEntry.name,completed_at:ts(),plugin:PLUGIN_VERSION,trace:TRACE,result:RESULT});
     await jobEntry.delete();log("Done: "+orderId);
   }else{
     await writeJSON(ERROR_FOLDER,jobEntry.name,{order_id:orderId,error:errorMsg,failed_at:ts(),plugin:PLUGIN_VERSION,trace:TRACE});
